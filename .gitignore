@@ -1,0 +1,17 @@
+.venv/
+labor.db
+__pycache__/
+*.pyc
+uploads/
+*.swp
+*.swo
+*.swn
+*~
+.vim/
+.*.swp
+.*.swo
+.*.swn
+*.un~
+logs/*.log
+logs/*.pid
+.labour_os_secret

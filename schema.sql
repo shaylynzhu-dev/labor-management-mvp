@@ -1,0 +1,97 @@
+PRAGMA foreign_keys = ON;
+
+CREATE TABLE IF NOT EXISTS person (
+    id INTEGER PRIMARY KEY,
+    name TEXT NOT NULL,
+    gender TEXT NOT NULL,
+    company_name TEXT NULL,
+    introducer TEXT NULL,
+    id_last4 TEXT NULL,
+    hk_macao_last4 TEXT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS quota (
+    id INTEGER PRIMARY KEY,
+    quota_type TEXT NOT NULL CHECK(quota_type IN ('SWD', 'LD')),
+    company_name TEXT NOT NULL,
+    approval_no TEXT NULL,
+    quota_no TEXT NULL,
+    user_id INTEGER NULL,
+    start_date DATE NULL,
+    end_date DATE NULL,
+    usage_count INTEGER NOT NULL DEFAULT 0 CHECK(usage_count >= 0),
+    replacement_count INTEGER NOT NULL DEFAULT 0 CHECK(replacement_count >= 0),
+    max_replacement_count INTEGER NOT NULL DEFAULT 1
+        CHECK(max_replacement_count IN (1, 2)),
+    status TEXT NOT NULL DEFAULT 'active'
+        CHECK(status IN ('active','in_use','exhausted','invalid')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (user_id) REFERENCES person(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS contract (
+    id INTEGER PRIMARY KEY,
+    contract_no TEXT NULL,
+    company_name TEXT NOT NULL,
+    person_id INTEGER NULL,
+    quota_id INTEGER NULL,
+    entry_date DATE NULL,
+    arrival_date DATE NULL,
+    contract_start_date DATE NULL,
+    contract_end_date DATE NULL,
+    start_date DATE NULL,
+    end_date DATE NULL,
+    cycle_index INTEGER NOT NULL DEFAULT 1 CHECK(cycle_index >= 1),
+    parent_contract_id INTEGER NULL,
+    is_replaced INTEGER NOT NULL DEFAULT 0 CHECK(is_replaced IN (0, 1)),
+    status TEXT NOT NULL DEFAULT '制作合同'
+        CHECK(status IN ('制作合同','交接香港同事','交表香港入境处',
+                         '批出入境签证','工人入境','完成合约')),
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    CHECK (entry_date IS NULL OR date(contract_start_date) = date(entry_date)),
+    CHECK (arrival_date IS NULL OR date(arrival_date) = date(entry_date)),
+    CHECK (contract_start_date IS NULL OR date(start_date) = date(contract_start_date)),
+    CHECK (contract_end_date IS NULL OR date(end_date) = date(contract_end_date)),
+    FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE SET NULL,
+    FOREIGN KEY (quota_id) REFERENCES quota(id) ON DELETE SET NULL,
+    FOREIGN KEY (parent_contract_id) REFERENCES contract(id) ON DELETE RESTRICT
+);
+
+CREATE TABLE IF NOT EXISTS event (
+    id INTEGER PRIMARY KEY,
+    event_type TEXT,
+    person_id INTEGER,
+    quota_id INTEGER,
+    contract_id INTEGER,
+    description TEXT,
+    severity TEXT DEFAULT 'normal',
+    event_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE SET NULL,
+    FOREIGN KEY (quota_id) REFERENCES quota(id) ON DELETE SET NULL,
+    FOREIGN KEY (contract_id) REFERENCES contract(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS risk (
+    id INTEGER PRIMARY KEY,
+    person_id INTEGER,
+    quota_id INTEGER,
+    contract_id INTEGER,
+    risk_type TEXT,
+    status TEXT DEFAULT 'open',
+    description TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE SET NULL,
+    FOREIGN KEY (quota_id) REFERENCES quota(id) ON DELETE SET NULL,
+    FOREIGN KEY (contract_id) REFERENCES contract(id) ON DELETE SET NULL
+);
+
+CREATE UNIQUE INDEX IF NOT EXISTS idx_contract_contract_no
+    ON contract(contract_no) WHERE contract_no IS NOT NULL;
+CREATE INDEX IF NOT EXISTS idx_event_person ON event(person_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_event_quota ON event(quota_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_event_contract ON event(contract_id, created_at);
+CREATE INDEX IF NOT EXISTS idx_risk_status ON risk(status, risk_type);
+CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_quota_expiry_open
+    ON risk(quota_id, risk_type) WHERE status = 'open';

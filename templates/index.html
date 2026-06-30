@@ -1,0 +1,295 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <script>if (location.protocol === 'file:') location.replace('http://127.0.0.1:5001/');</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Labour OS</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='operator.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='workbench.css') }}">
+</head>
+<body class="workbench-ui">
+  <aside class="sidebar">
+    <div class="brand"><span>LO</span><strong>Labour OS</strong><small>工作台</small></div>
+    <nav>
+      <a href="{{ url_for('index') }}" class="nav-item {{ 'active' if active_view == 'overview' }}" data-view="overview">工作台</a>
+      <a href="{{ url_for('people_page') }}" class="nav-item {{ 'active' if active_view == 'people' }}" data-view="people">人员</a>
+      <a href="{{ url_for('contracts_page') }}" class="nav-item {{ 'active' if active_view == 'contracts' }}" data-view="contracts">合同</a>
+      <a href="{{ url_for('quotas_page') }}" class="nav-item {{ 'active' if active_view == 'quotas' }}" data-view="quotas">名额</a>
+      <a href="{{ url_for('index', view='documents') }}" class="nav-item {{ 'active' if active_view == 'documents' }}" data-view="documents">资料库</a>
+      <a href="{{ url_for('index', view='workflows') }}" class="nav-item {{ 'active' if active_view == 'workflows' }}" data-view="workflows">业务流程</a>
+      <a href="{{ url_for('index', view='lifecycle') }}" class="nav-item {{ 'active' if active_view == 'lifecycle' }}" data-view="lifecycle">时间节点</a>
+      <a href="{{ url_for('risks_page') }}" class="nav-item {{ 'active' if active_view == 'risks' }}" data-view="risks">风险中心</a>
+      <a href="{{ url_for('tasks_page') }}" class="nav-item {{ 'active' if active_view == 'tasks' }}" data-view="tasks">任务提醒</a>
+      <a href="{{ url_for('index', view='renewals') }}" class="nav-item {{ 'active' if active_view == 'renewals' }}" data-view="renewals">续期评估</a>
+      <a href="{{ url_for('index', view='events') }}" class="nav-item {{ 'active' if active_view == 'events' }}" data-view="events">事件记录</a>
+      <a href="{{ url_for('index', view='ai') }}" class="nav-item {{ 'active' if active_view == 'ai' }}" data-view="ai">智能查询</a>
+    </nav>
+    <div class="admin"><span class="avatar">{{ (session.get('username') or '管')[:1] }}</span><span>{{ session.get('username') or '管理员' }}<br><small>{{ session.get('role') or '本地系统' }} · <a href="{{ url_for('auth.logout') }}">退出</a></small></span></div>
+  </aside>
+
+  <!-- Legacy upload URLs remain supported: /upload/person_excel /upload/quota_excel -->
+  <main class="app-shell">
+    <header class="topbar">
+      <div class="page-title"><h1>{{ 'My Work Queue' if active_view == 'overview' else 'Labour OS 工作台' }}</h1><p>{{ '我的工作队列 · 按紧急程度自动排序' if active_view == 'overview' else '一处完成日常业务办理' }}</p></div>
+      <form id="one-line-query-form" class="search" method="get" action="{{ url_for('index') }}">
+        <button type="submit" aria-label="执行搜索"><span aria-hidden="true">⌕</span></button>
+        <input id="one-line-query" name="q" value="{{ keyword }}" maxlength="300" placeholder="输入任何名字或编号，直接查询状态…" aria-label="One-line Query">
+        <span class="query-key">Enter</span>
+      </form>
+      <div class="actions">
+        <button class="button secondary" data-open="person-modal">新增人员</button>
+        <button class="button primary" data-open="contract-modal">新增合同</button>
+      </div>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+    {% endwith %}
+
+    <section id="inline-editor-host" class="inline-editor-host" hidden aria-live="polite"></section>
+
+    {% if false %}<section class="boss-stats" data-section="overview" hidden>
+      <a href="{{ url_for('risks_page') }}" class="boss-risk-high"><span>High Risk</span><strong data-live-high-risk>{{ boss_dashboard.risk_counts.high }}</strong><small>高风险 →</small></a>
+      <a href="{{ url_for('risks_page') }}" class="boss-risk-medium"><span>Medium Risk</span><strong data-live-medium-risk>{{ boss_dashboard.risk_counts.medium }}</strong><small>中风险 →</small></a>
+      <a href="{{ url_for('risks_page') }}"><span>Low Risk</span><strong data-live-low-risk>{{ boss_dashboard.risk_counts.low }}</strong><small>低风险 →</small></a>
+      <a href="{{ url_for('contracts_page') }}"><span>90天内合同到期</span><strong data-live-contracts-90>{{ boss_dashboard.expiring_contracts_90|length }}</strong><small>查看合同 →</small></a>
+      <a href="{{ url_for('risks_page') }}"><span>90天内证件预警</span><strong data-live-certificate-risk>{{ boss_dashboard.certificate_due_90|length }}</strong><small>查看证件风险 →</small></a>
+    </section>{% endif %}
+
+    <section class="dashboard-home" data-section="overview" {{ 'hidden' if active_view != 'overview' }}>
+      <section id="one-line-result" class="panel one-line-result" {{ '' if keyword else 'hidden' }} aria-live="polite">
+        <div class="panel-head"><div><h2>One-line Query</h2><p>“{{ keyword }}”</p></div></div>
+        {% if one_line_result %}<div class="one-line-answer"><div><span>对象</span><strong>{{ one_line_result.subject }}</strong></div><div><span>当前状态</span><strong>{{ one_line_result.current_status }}</strong></div><div><span>下一步建议操作</span><strong>{{ one_line_result.next_action }}</strong></div><div><span>是否需要处理</span><strong class="need-{{ one_line_result.needs_action|lower }}">{{ one_line_result.needs_action }}</strong></div><a class="button primary" href="{{ one_line_result.detail_url }}">打开业务记录</a></div>{% else %}<p class="empty-block">没有找到对应的人员、合同、名额或事件。</p>{% endif %}
+      </section>
+
+      <section class="panel decision-center">
+        <div class="panel-head"><div><h2>My Work Queue（我的待办队列）</h2><p>所有事项按紧急程度排成一个队列</p></div><span class="push-status">Push 已连接</span></div>
+        <div class="decision-list">
+          {% for action in boss_dashboard.decision_actions %}
+          <article class="queue-card priority-rail-{{ action.priority|lower }}">
+            <div class="queue-rank"><span class="priority-code priority-{{ action.priority|lower }}">{{ action.priority }}</span><small>#{{ action.rank }}</small></div>
+            <div class="decision-copy"><strong>{{ action.title }}</strong><small>{{ action.reason }}</small><b>下一步（系统建议动作）：{{ action.suggestion }}</b></div>
+            <div class="decision-score"><span>紧急度</span><strong>{{ action.score }}</strong></div>
+            {% if action.can_execute %}
+              {% if action.kind == 'contract_renewal' %}<form method="post" action="{{ url_for('create_contract_renewal_task') }}"><input type="hidden" name="contract_id" value="{{ action.contract_id }}"><button class="action-button">创建续约任务</button></form>
+              {% elif action.kind == 'quota_replacement' %}<form method="post" action="{{ url_for('create_quota_replacement_flow') }}"><input type="hidden" name="risk_id" value="{{ action.risk_id }}"><button class="action-button">创建替补流程</button></form>
+              {% elif action.kind == 'risk_reminder' %}<form method="post" action="{{ url_for('create_decision_reminder_task') }}"><input type="hidden" name="risk_id" value="{{ action.risk_id }}"><button class="action-button">创建提醒任务</button></form>
+              {% elif action.kind == 'event_reminder' %}<form method="post" action="{{ url_for('create_decision_reminder_task') }}"><input type="hidden" name="event_id" value="{{ action.event_id }}"><input type="hidden" name="days" value="{{ action.days }}"><button class="action-button">创建提醒任务</button></form>{% endif %}
+            {% else %}<span class="action-disabled">缺少关联人员，暂不可执行</span>{% endif %}
+          </article>
+          {% else %}<p class="empty-block">当前 Contract、Event 与 Risk 没有产生建议动作。</p>{% endfor %}
+        </div>
+      </section>
+
+      {% if false %}<div class="boss-grid" hidden>
+        <section class="panel boss-panel">
+          <div class="panel-head"><div><h2>90天内合同到期</h2><p>来自 Contract</p></div><a class="text-link" href="{{ url_for('contracts_page') }}">进入合同管理</a></div>
+          <div class="boss-list">{% for contract in boss_dashboard.expiring_contracts_90 %}<a href="{{ url_for('contract_detail', contract_id=contract.contract_id) }}"><span class="boss-date">{{ contract.end_date }}</span><div><strong>{{ contract.contract_id }} · {{ contract.person_name }}</strong><small>{{ contract.company }} · 剩余{{ contract.remaining_days }}天</small></div><b>{{ contract.status }}</b></a>{% else %}<p class="empty-block">未来90天没有合同到期。</p>{% endfor %}</div>
+          {% if boss_dashboard.expiring_contracts_90 %}<div class="system-advice"><strong>系统建议动作</strong><span>建议续约 / 替补；可在 Priority Ranking 创建续约任务。</span></div>{% endif %}
+        </section>
+
+        <section class="panel boss-panel">
+          <div class="panel-head"><div><h2>90天内证件到期</h2><p>来自 Person 关联的 Risk</p></div><a class="text-link" href="{{ url_for('risks_page') }}">进入风险中心</a></div>
+          <div class="boss-list">{% for item in boss_dashboard.certificate_due_90 %}<a href="{{ url_for('risks_page') }}"><span class="risk-level risk-{{ 'high' if item.risk.risk_level == '高' else 'medium' }}">{{ item.risk.risk_level }}</span><div><strong>{{ item.risk.person_name or '关联人员' }}</strong><small>{{ item.risk.reason }}</small></div><b>{{ item.due_date }}</b></a>{% else %}<p class="empty-block">当前没有可确认的90天证件到期记录。</p>{% endfor %}</div>
+          {% if boss_dashboard.certificate_due_90 %}<div class="system-advice"><strong>系统建议动作</strong><span>建议启动更新流程；可创建证件提醒任务。</span></div>{% endif %}
+          {% if boss_dashboard.certificate_without_date %}<a class="data-gap" href="{{ url_for('risks_page') }}">{{ boss_dashboard.certificate_without_date|length }} 条证件风险缺少明确到期日，未计入90天数字 →</a>{% endif %}
+        </section>
+
+        <section class="panel boss-panel quota-overview">
+          <div class="panel-head"><div><h2>名额使用情况</h2><p>来自 Quota 使用记录</p></div><a class="text-link" href="{{ url_for('quotas_page') }}">进入名额管理</a></div>
+          {% for type in ['SWD','LD'] %}{% set summary = boss_dashboard.quota_summary[type] %}<a class="quota-summary-row" href="{{ url_for('quotas_page', q=type) }}"><span class="quota-type type-{{ type|lower }}">{{ type }}</span><div><strong>{{ summary.occupied }} / {{ summary.total }} 已使用</strong><small>累计{{ summary.used_months }}个月 · 剩余{{ summary.remaining_months }}个月</small><i><em style="width:{{ (summary.occupied * 100 / summary.total)|round if summary.total else 0 }}%"></em></i></div><b>查看 →</b></a>{% endfor %}
+          {% if boss_dashboard.quota_risks %}<div class="system-advice"><strong>系统建议动作</strong><span>Risk 表存在名额风险，建议释放或替补。</span></div>{% endif %}
+        </section>
+
+        <section class="panel boss-panel entry-overview">
+          <div class="panel-head"><div><h2>入境后任务</h2><p>从 Event 入境日期推导30 / 45 / 60天节点</p></div><a class="text-link" href="{{ url_for('index', view='events') }}">进入事件记录</a></div>
+          <div class="boss-list milestone-list">{% for item in boss_dashboard.entry_milestones %}<a href="{{ url_for('index', view='events', q=item.person_name) }}"><span class="milestone-day">{{ item.days }}D</span><div><strong>{{ item.person_name }}</strong><small>入境 {{ item.entry_date }} · 节点 {{ item.due_date }}</small></div><b class="{{ 'metric-danger' if item.status == '已到期' }}">{{ item.status }}</b></a>{% else %}<p class="empty-block">暂无入境事件，暂不能生成30/45/60天节点。</p>{% endfor %}</div>
+          {% if boss_dashboard.entry_milestones %}<div class="system-advice"><strong>系统建议动作</strong><span>按 Event 节点创建 Reminder Task。</span></div>{% endif %}
+        </section>
+      </div>{% endif %}
+
+      <div class="quick-actions panel boss-quick-actions">
+        <div><h2>快速办理</h2><p>保留原有业务功能</p></div>
+        <button class="quick-action" data-open="person-modal"><strong>新增人员</strong><span>建立人员档案</span></button>
+        <button class="quick-action" data-open="contract-modal"><strong>新增合同</strong><span>登记合同周期</span></button>
+        <button class="quick-action" data-open="quota-modal"><strong>新增名额</strong><span>创建 SWD / LD 名额</span></button>
+        <button class="quick-action" data-open="event-modal"><strong>记录事件</strong><span>登记签证或入境</span></button>
+      </div>
+      <p class="live-note">系统自动更新于 <span data-live-time>页面打开时</span></p>
+    </section>
+
+    <div class="workspace">
+      <section class="panel entity-panel contract-panel" data-section="contracts" {{ 'hidden' if active_view != 'contracts' }}>
+        <div class="panel-head contract-head">
+          <div><h2>合同列表</h2><p>共 {{ contracts|length }} 条记录</p></div><button class="text-button" data-open="contract-import-modal">导入合同Excel</button>
+          <form class="status-filter" method="get">
+            {% if keyword %}<input type="hidden" name="q" value="{{ keyword }}">{% endif %}
+            <label for="status-filter">状态筛选</label>
+            <select id="status-filter" name="status" onchange="this.form.submit()">
+              <option value="">全部状态</option>
+              {% for status in contract_statuses %}<option value="{{ status }}" {{ 'selected' if selected_status == status }}>{{ status }}</option>{% endfor %}
+            </select>
+          </form>
+        </div>
+        <div class="entity-grid">
+          {% for contract in contracts %}
+          <article class="entity-card contract-card">
+            <div class="entity-card-head"><div><span class="entity-kind">合同</span><a href="{{ url_for('contract_detail', contract_id=contract.contract_id) }}">{{ contract.contract_id }}</a></div><span class="status-chip" data-status="{{ contract.status }}">{{ contract.status }}</span></div>
+            <div class="entity-primary"><strong>{{ contract.person_name }}</strong><span>{{ contract.company }}</span></div>
+            <dl class="entity-meta"><div><dt>实际入境</dt><dd>{{ contract.arrival_date or '待入境事件' }}</dd></div><div><dt>合同周期</dt><dd>{{ contract.contract_start_date or '待开始' }} → {{ contract.contract_end_date or '待计算' }}</dd></div><div><dt>剩余时间</dt><dd>{% if contract.remaining_days is not none %}<span class="days {{ 'overdue' if contract.remaining_days < 0 else 'soon' if contract.remaining_days <= 30 }}">{{ ('已到期 ' ~ (-contract.remaining_days) ~ ' 天') if contract.remaining_days < 0 else (contract.remaining_days ~ ' 天') }}</span>{% else %}待入境{% endif %}</dd></div></dl>
+            <div class="entity-actions"><a class="text-link" href="{{ url_for('contract_detail', contract_id=contract.contract_id) }}">查看详情</a><button type="button" class="text-button" data-card-edit="contract-edit-{{ loop.index }}">内联编辑</button></div>
+            <form id="contract-edit-{{ loop.index }}" class="card-editor" data-json-form data-method="PATCH" action="{{ url_for('api_update_contract', contract_id=contract.contract_id) }}" hidden>
+              <label>公司<input name="company" value="{{ contract.company }}" required></label><label>状态<select name="status">{% for status in contract_statuses %}<option {{ 'selected' if contract.status == status }}>{{ status }}</option>{% endfor %}</select></label>
+              <div class="card-editor-actions"><button type="button" class="button secondary" data-card-cancel>取消</button><button class="button primary">保存</button></div>
+            </form>
+          </article>
+          {% else %}<p class="empty-block">暂无符合条件的合同。</p>{% endfor %}
+        </div>
+      </section>
+
+      <section class="panel entity-panel people-panel" data-section="people" {{ 'hidden' if active_view != 'people' }}>
+        <div class="panel-head"><div><h2>人员列表</h2><p>共 {{ people|length }} 条记录</p></div><button class="text-button" data-open="person-import-modal">导入人员Excel</button></div>
+        <div class="entity-grid">
+          {% for person in people %}
+          <article class="entity-card person-card">
+            <div class="entity-card-head"><div><span class="entity-kind">人员</span><strong>{{ person.name }}</strong></div>{% if person.latest_status %}<span class="status-chip" data-status="{{ person.latest_status }}">{{ person.latest_status }}</span>{% endif %}</div>
+            <div class="entity-primary"><strong>{{ person.gender or '未填写' }}</strong><span>{{ person.company_name or '公司待补充' }}</span></div>
+            <dl class="entity-meta"><div><dt>介绍人</dt><dd>{{ person.introducer or '—' }}</dd></div><div><dt>当前名额</dt><dd>{{ person.quota_number or '待分配' }}</dd></div><div><dt>证件后四位</dt><dd>{{ person.id_last4 or '—' }} / {{ person.permit_last4 or '—' }}</dd></div></dl>
+            <div class="entity-actions"><a class="text-link" href="{{ url_for('contracts_page', q=person.name) }}">查看合同</a><button type="button" class="text-button" data-event-person="{{ person.id }}">记录事件</button><button type="button" class="text-button" data-card-edit="person-edit-{{ person.id }}">内联编辑</button></div>
+            <form id="person-edit-{{ person.id }}" class="card-editor" data-json-form data-method="PATCH" action="{{ url_for('api_update_person', person_id=person.id) }}" hidden>
+              <label>姓名<input name="name" value="{{ person.name }}" required></label><label>性别<select name="gender" required><option value="男" {{ 'selected' if person.gender == '男' }}>男</option><option value="女" {{ 'selected' if person.gender == '女' }}>女</option></select></label><label>公司<input name="company_name" value="{{ person.company_name or '' }}"></label><label>介绍人<input name="introducer" value="{{ person.introducer or '' }}"></label>
+              <div class="card-editor-actions"><button type="button" class="button secondary" data-card-cancel>取消</button><button class="button primary">保存</button></div>
+            </form>
+          </article>
+          {% else %}<p class="empty-block">暂无人员，点击“新增人员”开始登记。</p>{% endfor %}
+        </div>
+      </section>
+
+      <section class="panel event-panel" data-section="events" {{ 'hidden' if active_view != 'events' }}>
+        <div class="panel-head"><div><h2>最近事件</h2><p>人员状态变化</p></div><button class="text-button" data-open="event-modal">记录事件</button></div>
+        <div class="timeline">
+          {% for event in events %}
+          <article><span class="dot"></span><div><strong>{{ event.event_type }}</strong><p>{{ event.person_name }}{% if event.note %} · {{ event.note }}{% endif %}</p><time>{{ event.event_date or event.created_at }}</time></div></article>
+          {% else %}<p class="empty">暂无事件记录。</p>{% endfor %}
+        </div>
+      </section>
+
+      <section class="panel entity-panel quota-panel" data-section="quotas" {{ 'hidden' if active_view != 'quotas' }}>
+        <div class="panel-head"><div><h2>配额使用管理</h2><p>支持先建档、后补批文与使用资料</p></div><span class="inline-actions"><button class="text-button" data-open="quota-import-modal">导入配额Excel</button><button class="text-button" data-open="quota-modal">添加配额</button></span></div>
+        <div class="entity-grid">
+          {% for quota in quotas %}
+          <article class="entity-card quota-card">
+            <div class="entity-card-head"><div><span class="entity-kind">名额</span><a href="{{ url_for('quota_detail', quota_id=quota.id) }}">{{ quota.display_label }}</a></div><span class="quota-type type-{{ quota.quota_type|lower }}">{{ quota.quota_type }}</span></div>
+            <div class="entity-primary"><strong>{{ quota.person_name or '待分配使用人' }}</strong><span>{{ quota.company_name }}</span></div>
+            <dl class="entity-meta"><div><dt>批文号</dt><dd>{{ quota.approval_number or '待补充' }}</dd></div><div><dt>使用时间</dt><dd>{{ quota.used_months }} / 24 个月</dd></div><div><dt>剩余额度</dt><dd><strong class="quota-remaining {{ 'quota-empty' if quota.remaining_months == 0 }}">{{ quota.remaining_months }} 个月</strong></dd></div></dl>
+            <div class="quota-progress" aria-label="已使用 {{ quota.used_months }} 个月"><span style="width:{{ [quota.used_months * 100 / 24, 100]|min }}%"></span></div>
+            <div class="entity-actions"><a class="text-link" href="{{ url_for('quota_detail', quota_id=quota.id) }}">查看详情</a><button type="button" class="text-button" data-assign-quota="{{ quota.id }}" data-quota-label="{{ quota.display_label }} · {{ quota.quota_type }}">{{ '替补人员' if quota.person_name else '开始使用' }}</button><button type="button" class="text-button" data-card-edit="quota-edit-{{ quota.id }}">内联编辑</button></div>
+            <form id="quota-edit-{{ quota.id }}" class="card-editor" data-json-form data-method="PATCH" action="{{ url_for('api_update_quota', quota_id=quota.id) }}" hidden>
+              <label>类型<select name="quota_type"><option {{ 'selected' if quota.quota_type == 'SWD' }}>SWD</option><option {{ 'selected' if quota.quota_type == 'LD' }}>LD</option></select></label><label>公司<input name="company_name" value="{{ quota.company_name }}" required></label><label>批文号<input name="approval_number" value="{{ quota.approval_number or '' }}"></label><label>配额序号<input name="quota_serial" value="{{ quota.quota_serial or '' }}"></label><label>批文有效期<input type="date" name="expiry_date" value="{{ quota.expiry_date or '' }}"></label>
+              <div class="card-editor-actions"><button type="button" class="button secondary" data-card-cancel>取消</button><button class="button primary">保存</button></div>
+            </form>
+          </article>
+          {% else %}<p class="empty-block">暂无名额，请先添加。</p>{% endfor %}
+        </div>
+      </section>
+
+      <section class="panel renewal-panel" data-section="renewals" {{ 'hidden' if active_view != 'renewals' }}>
+        <div class="panel-head"><div><h2>续期评估</h2><p>自动计算续期启动日、提交截止日和续期状态</p></div><button class="text-button" data-open="renewal-modal">新增评估</button></div>
+        <div class="table-wrap"><table><thead><tr><th>人员</th><th>名额</th><th>当前合同结束</th><th>续期启动日</th><th>护照检查</th><th>身份证检查</th><th>提交截止日</th><th>状态</th></tr></thead><tbody>
+          {% for renewal in renewals %}<tr><td class="name">{{ renewal.person_name }}</td><td>{{ renewal.quota_number }}<small>{{ renewal.quota_type }}</small></td><td>{{ renewal.current_contract_end_date }}</td><td>{{ renewal.renewal_start_date }}<small>提前3个月</small></td><td><span class="check check-{{ 'pass' if renewal.passport_expiry_check == '通过' else 'fail' if renewal.passport_expiry_check == '不通过' else 'pending' }}">{{ renewal.passport_expiry_check }}</span></td><td><span class="check check-{{ 'pass' if renewal.id_card_expiry_check == '通过' else 'fail' if renewal.id_card_expiry_check == '不通过' else 'pending' }}">{{ renewal.id_card_expiry_check }}</span></td><td>{{ renewal.submission_deadline }}<small>结束前1个月</small></td><td><span class="renewal-status {{ 'renewal-ok' if renewal.status == '可续' else 'renewal-no' if renewal.status == '不可续' else 'renewal-risk' }}">{{ renewal.status }}</span></td></tr>
+          {% else %}<tr><td colspan="8" class="empty">暂无续期评估，点击“新增评估”开始。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel os-panel" data-section="documents" {{ 'hidden' if active_view != 'documents' }}>
+        <div class="panel-head os-head"><div><h2>资料库</h2><p>资料绑定人员、名额和流程，支持文字识别与查询</p></div><button class="text-button" data-open="document-modal">上传资料</button></div>
+        <form class="module-search" method="get"><input type="hidden" name="view" value="documents"><input name="doc_q" value="{{ document_keyword }}" placeholder="搜索标题、文件名或OCR内容"><button class="button secondary">查询资料</button></form>
+        <div class="table-wrap"><table><thead><tr><th>资料</th><th>人员</th><th>名额</th><th>流程</th><th>OCR</th><th>上传时间</th><th>文件</th></tr></thead><tbody>
+          {% for document in documents %}<tr><td class="name">{{ document.title }}<small>{{ document.filename }}</small></td><td>{{ document.person_name }}</td><td>{{ document.quota_number }}</td><td>{{ document.workflow_code }}</td><td><span class="check {{ 'check-pass' if document.ocr_status in ['已OCR','已提取','人工补录'] else 'check-pending' }}">{{ document.ocr_status }}</span></td><td>{{ document.created_at }}</td><td><a class="text-link" href="{{ url_for('download_document', document_id=document.id) }}">下载</a></td></tr>
+          {% else %}<tr><td colspan="7" class="empty">暂无资料文件。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel os-panel" data-section="workflows" {{ 'hidden' if active_view != 'workflows' }}>
+        <div class="panel-head"><div><h2>合同生命周期</h2><p>制作合同 → 交接香港同事 → 交表香港入境处 → 批出入境签证 → 工人入境 → 完成合约</p></div><button class="text-button" data-open="workflow-modal">创建流程</button></div>
+        <div class="table-wrap"><table><thead><tr><th>流程编号</th><th>人员 / 名额</th><th>当前步骤</th><th>流程状态</th><th>更新时间</th><th>审批</th></tr></thead><tbody>
+          {% for workflow in workflows %}<tr><td class="name">{{ workflow.workflow_code }}<small>{{ workflow.workflow_name }}</small></td><td>{{ workflow.person_name }}<small>{{ workflow.quota_number }}</small></td><td>{{ workflow.current_step }}</td><td><span class="workflow-status">{{ workflow.status }}</span></td><td>{{ workflow.updated_at }}</td><td>{% if workflow.status == '进行中' and workflow.active_step_id %}<form class="inline-actions" method="post" action="{{ url_for('workflow_step_action', step_id=workflow.active_step_id) }}"><button class="text-button" name="action" value="approve">通过</button><button class="text-button danger" name="action" value="reject">拒绝</button></form>{% else %}—{% endif %}</td></tr>
+          {% else %}<tr><td colspan="6" class="empty">暂无审批流程。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel os-panel" data-section="lifecycle" {{ 'hidden' if active_view != 'lifecycle' }}>
+        <div class="panel-head"><div><h2>Lifecycle Engine</h2><p>自动生成续约、提交与到期时间节点</p></div></div>
+        <div class="table-wrap"><table><thead><tr><th>时间节点</th><th>人员</th><th>名额</th><th>流程</th><th>日期</th><th>状态</th><th>操作</th></tr></thead><tbody>
+          {% for node in lifecycle_nodes %}<tr><td class="name">{{ node.node_type }}</td><td>{{ node.person_name }}</td><td>{{ node.quota_number }}</td><td>{{ node.workflow_code or '—' }}</td><td>{{ node.due_date }}</td><td><span class="node-status node-{{ 'overdue' if node.status == '逾期' else 'done' if node.status == '已完成' else 'pending' }}">{{ node.status }}</span></td><td>{% if node.status != '已完成' %}<form method="post" action="{{ url_for('complete_lifecycle_node', node_id=node.id) }}"><button class="text-button">标记完成</button></form>{% else %}—{% endif %}</td></tr>
+          {% else %}<tr><td colspan="7" class="empty">创建续期评估后将自动生成时间节点。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel os-panel" data-section="risks" {{ 'hidden' if active_view != 'risks' }}>
+        <div class="panel-head"><div><h2>风险中心</h2><p>合同、证件、资料与名额风险自动更新</p></div><span class="auto-badge">自动更新</span></div>
+        <div class="module-metrics"><article><span>高风险</span><strong class="metric-danger" data-live-high-risk>{{ risk_counts.high }}</strong></article><article><span>中风险</span><strong class="metric-warning">{{ risk_counts.medium }}</strong></article><article><span>低风险</span><strong>{{ risk_counts.low }}</strong></article><article><span>已解决</span><strong>{{ risk_counts.resolved }}</strong></article></div>
+        <div class="table-wrap"><table><thead><tr><th>风险等级</th><th>类型</th><th>人员</th><th>名额 / 合同</th><th>风险原因</th><th>状态</th><th>操作</th></tr></thead><tbody>
+          {% for risk in risks %}<tr><td><span class="risk-level risk-{{ 'high' if risk.risk_level == '高' else 'medium' if risk.risk_level == '中' else 'low' }}">{{ risk.risk_level }}</span></td><td>{{ risk.risk_type }}</td><td>{{ risk.person_name or '—' }}</td><td>{% if risk.contract_id %}<a class="text-link" href="{{ url_for('contract_detail', contract_id=risk.contract_id) }}">{{ risk.contract_id }}</a>{% elif risk.quota_id %}<a class="text-link" href="{{ url_for('quota_detail', quota_id=risk.quota_id) }}">{{ risk.quota_number }}</a>{% else %}—{% endif %}</td><td>{{ risk.reason }}</td><td>{{ risk.status }}</td><td>{% if risk.status == '开放' %}<form method="post" action="{{ url_for('resolve_risk', risk_id=risk.id) }}"><button class="text-button">标记已解决</button></form>{% else %}<span class="muted">已处理</span>{% endif %}</td></tr>
+          {% else %}<tr><td colspan="7" class="empty">当前没有自动识别到风险。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel os-panel" data-section="tasks" {{ 'hidden' if active_view != 'tasks' }}>
+        <div class="panel-head"><div><h2>任务提醒</h2><p>入境后自动生成7天与30天提醒任务</p></div><span class="auto-badge">自动更新</span></div>
+        <div class="module-metrics"><article><span>待办</span><strong>{{ task_counts['待办'] }}</strong></article><article><span>进行中</span><strong>{{ task_counts['进行中'] }}</strong></article><article><span>已逾期</span><strong class="metric-danger" data-live-overdue-task>{{ task_counts['逾期'] }}</strong></article><article><span>已完成</span><strong>{{ task_counts['已完成'] }}</strong></article></div>
+        <div class="table-wrap"><table><thead><tr><th>任务</th><th>人员</th><th>名额</th><th>流程</th><th>到期日</th><th>触发方式</th><th>状态</th></tr></thead><tbody>
+          {% for task in tasks %}<tr><td class="name">{{ task.title }}</td><td>{{ task.person_name }}</td><td>{{ task.quota_number or '—' }}</td><td>{{ task.workflow_code or '—' }}</td><td>{{ task.due_date }}</td><td>{{ task.trigger_type }}</td><td><form method="post" action="{{ url_for('update_task_status', task_id=task.id) }}"><select class="compact-select" name="status" onchange="this.form.submit()">{% for status in task_statuses %}<option {{ 'selected' if task.status == status }}>{{ status }}</option>{% endfor %}</select></form></td></tr>
+          {% else %}<tr><td colspan="7" class="empty">工人入境后会自动生成提醒任务。</td></tr>{% endfor %}
+        </tbody></table></div>
+      </section>
+
+      <section class="panel ai-panel" data-section="ai" {{ 'hidden' if active_view != 'ai' }}>
+        <div class="ai-intro">
+          <div class="ai-mark" aria-hidden="true">AI</div>
+          <div><h2>合同智能问答</h2><p>优先查询合同周期、剩余天数、状态与关联人员</p></div>
+        </div>
+        <form id="ai-question-form" class="ai-form">
+          <label for="ai-question">输入问题</label>
+          <div class="ai-input-row">
+            <input id="ai-question" maxlength="300" required placeholder="例如：C2026-001什么时候到期？">
+            <button class="button primary" type="submit">查询并总结</button>
+          </div>
+          <div class="ai-examples"><span>试试：</span><button type="button" data-question="C2026-001什么时候到期？">C2026-001什么时候到期？</button><button type="button" data-question="张三的合同还剩多少天？">张三的合同还剩多少天？</button></div>
+        </form>
+        <div id="ai-loading" class="ai-loading" hidden>正在查询数据库并整理回答…</div>
+        <div id="ai-answer" class="ai-answer" hidden aria-live="polite"></div>
+      </section>
+    </div>
+  </main>
+  <aside id="push-tray" class="push-tray" aria-live="assertive" aria-label="即时提醒"></aside>
+
+  <dialog id="contract-modal"><form method="post" action="{{ url_for('add_contract') }}"><div class="modal-head"><h2>添加合同</h2><button type="button" data-close aria-label="关闭">×</button></div><label>合同编号<input name="contract_id" required placeholder="例如 C2026-001"></label><label>关联人员<select name="person_id" required><option value="">请选择人员</option>{% for person in all_people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>绑定配额<select name="quota_id" required><option value="">请选择有效配额</option>{% for quota in quotas %}{% if quota.status not in ['invalid','exhausted'] %}<option value="{{ quota.id }}">{{ quota.display_label }} · {{ quota.quota_type }}</option>{% endif %}{% endfor %}</select></label><label>公司<input name="company" required placeholder="请输入公司名称"></label><div class="rule-note"><strong>统一调度规则</strong><span>新合同从“制作合同”开始；进入“工人入境”时才以事件日期写入合同开始日并累计配额使用次数。</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">保存合同</button></div></form></dialog>
+
+  <dialog id="person-modal"><form method="post" action="{{ url_for('add_person') }}"><div class="modal-head"><div><h2>添加人员</h2><p>先建立基础档案，其他资料可稍后补充</p></div><button type="button" data-close aria-label="关闭">×</button></div><label>人员姓名<input name="person_name" required autocomplete="name" placeholder="请输入人员姓名"></label><label>性别<select name="gender" required><option value="">请选择性别</option><option value="男">男</option><option value="女">女</option></select></label><label>公司名称 <span class="optional">（可选）</span><input name="company_name" placeholder="可稍后补充"></label><label>介绍人 <span class="optional">（可选）</span><input name="introducer" placeholder="可稍后补充"></label><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">保存人员</button></div></form></dialog>
+
+  <dialog id="person-import-modal"><form method="post" action="{{ url_for('production_imports.person_import') }}" enctype="multipart/form-data"><div class="modal-head"><div><h2>导入人员Excel</h2><p>必填列：姓名、性别</p></div><button type="button" data-close aria-label="关闭">×</button></div><label>Excel 文件<input type="file" name="file" accept=".xlsx" required></label><div class="rule-note"><strong>支持列</strong><span>姓名、性别、公司名、介绍人、身份证后四位、港澳通行证后四位；重复数据自动跳过</span></div><a class="text-link" href="{{ url_for('production_imports.download_template', kind='person') }}">下载人员导入模板</a><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">开始导入</button></div></form></dialog>
+
+  <dialog id="quota-modal"><form method="post" action="{{ url_for('add_quota') }}"><div class="modal-head"><div><h2>添加配额</h2><p>只需类型和公司即可先建立配额</p></div><button type="button" data-close aria-label="关闭">×</button></div><label>配额类型<select name="quota_type" required>{% for type in quota_types %}<option>{{ type }}</option>{% endfor %}</select></label><label>公司名<input name="company_name" required placeholder="请输入公司名称"></label><div class="optional-section"><strong>可选字段</strong><span>以下资料均可稍后补充</span></div><label>批文号 <span class="optional">（可选）</span><input name="approval_number" placeholder="可稍后补充"></label><label>配额序号 <span class="optional">（可选）</span><input name="quota_serial" placeholder="可稍后补充"></label><label>使用人 <span class="optional">（可选）</span><select name="assigned_user"><option value="">暂不分配</option>{% for person in all_people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>批文有效期 <span class="optional">（可选）</span><input type="date" name="expiry_date"></label><div class="rule-note"><strong>半数据状态</strong><span>资料不完整不会阻止创建；SWD / LD 使用时长将在开始使用后自动计算。</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">保存配额</button></div></form></dialog>
+
+  <dialog id="quota-import-modal"><form method="post" action="{{ url_for('production_imports.quota_import') }}" enctype="multipart/form-data"><div class="modal-head"><div><h2>导入配额Excel</h2><p>必填列：配额类型、公司名</p></div><button type="button" data-close aria-label="关闭">×</button></div><label>Excel 文件<input type="file" name="file" accept=".xlsx" required></label><div class="rule-note"><strong>支持列</strong><span>配额类型、公司名、批文号、配额序号、使用人、开始日期、结束日期；重复数据自动跳过</span></div><a class="text-link" href="{{ url_for('production_imports.download_template', kind='quota') }}">下载配额导入模板</a><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">开始导入</button></div></form></dialog>
+
+  <dialog id="contract-import-modal"><form method="post" action="{{ url_for('production_imports.contract_import') }}" enctype="multipart/form-data"><div class="modal-head"><div><h2>导入合同Excel</h2><p>必填列：公司名</p></div><button type="button" data-close aria-label="关闭">×</button></div><label>Excel 文件<input type="file" name="file" accept=".xlsx" required></label><div class="rule-note"><strong>支持列</strong><span>合同编号、公司名、人员、配额序号、状态；入境日期必须通过事件记录</span></div><a class="text-link" href="{{ url_for('production_imports.download_template', kind='contract') }}">下载合同导入模板</a><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">开始导入</button></div></form></dialog>
+
+  <dialog id="quota-usage-modal"><form id="quota-usage-form" method="post"><div class="modal-head"><div><h2>更换使用人</h2><p id="quota-usage-label"></p></div><button type="button" data-close aria-label="关闭">×</button></div><label>新使用人<select name="person_id" required><option value="">请选择人员</option>{% for person in all_people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>开始日期<input type="date" name="start_date" value="{{ today }}" required></label><div class="rule-note"><strong>替补规则</strong><span>保存后旧使用记录将在该日期结束，新记录从该日期开始。</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">确认替补</button></div></form></dialog>
+
+  <dialog id="renewal-modal"><form method="post" action="{{ url_for('add_renewal') }}"><div class="modal-head"><h2>新增续期评估</h2><button type="button" data-close aria-label="关闭">×</button></div><label>人员<select name="person_id" required><option value="">请选择人员</option>{% for person in all_people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>名额<select name="quota_id" required><option value="">请选择名额</option>{% for quota in quotas %}<option value="{{ quota.id }}">{{ quota.quota_number }} · {{ quota.quota_type }}</option>{% endfor %}</select></label><label>当前合同结束日期<input type="date" name="current_contract_end_date" required></label><div class="date-grid"><label>护照有效期检查<select name="passport_expiry_check" required>{% for check in expiry_checks %}<option>{{ check }}</option>{% endfor %}</select></label><label>身份证有效期检查<select name="id_card_expiry_check" required>{% for check in expiry_checks %}<option>{{ check }}</option>{% endfor %}</select></label></div><div class="rule-note"><strong>自动计算</strong><span>续期启动日提前3个月；提交截止日为合同结束前1个月；状态由证件检查与截止日期自动判定。</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">保存评估</button></div></form></dialog>
+
+  <dialog id="workflow-modal"><form method="post" action="{{ url_for('create_workflow') }}"><div class="modal-head"><h2>创建合同生命周期</h2><button type="button" data-close aria-label="关闭">×</button></div><label>流程名称<input name="workflow_name" value="合同生命周期" required></label><label>人员<select name="person_id" required><option value="">请选择人员</option>{% for person in all_people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>名额<select name="quota_id" required><option value="">请选择名额</option>{% for quota in quotas %}<option value="{{ quota.id }}">{{ quota.quota_number }} · {{ quota.quota_type }}</option>{% endfor %}</select></label><div class="rule-note"><strong>固定状态机</strong><span>制作合同 → 交接香港同事 → 交表香港入境处 → 批出入境签证 → 工人入境 → 完成合约</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">创建流程</button></div></form></dialog>
+
+  <dialog id="document-modal"><form method="post" action="{{ url_for('upload_document') }}" enctype="multipart/form-data"><div class="modal-head"><h2>上传资料</h2><button type="button" data-close aria-label="关闭">×</button></div><label>资料标题<input name="title" required placeholder="例如 护照扫描件"></label><label>文件<input type="file" name="file" accept=".txt,.png,.jpg,.jpeg,.tif,.tiff,.pdf" required></label><label>人员<select name="person_id" required><option value="">请选择人员</option>{% for person in all_people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>名额<select name="quota_id" required><option value="">请选择名额</option>{% for quota in quotas %}<option value="{{ quota.id }}">{{ quota.quota_number }}</option>{% endfor %}</select></label><label>流程<select name="workflow_id" required><option value="">请选择流程</option>{% for workflow in workflows %}<option value="{{ workflow.id }}">{{ workflow.workflow_code }}</option>{% endfor %}</select></label><label>OCR文字补录（可选）<textarea name="ocr_text" rows="3" placeholder="无OCR引擎时可人工补录"></textarea></label><div class="rule-note"><strong>强制绑定</strong><span>每份文件必须同时绑定 person、quota 和 workflow。</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">上传并识别</button></div></form></dialog>
+
+  <dialog id="event-modal"><form method="post" action="{{ url_for('add_event') }}"><div class="modal-head"><h2>记录调度事件</h2><button type="button" data-close aria-label="关闭">×</button></div><label>人员<select name="person_id" required><option value="">请选择人员</option>{% for person in all_people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>生命周期 / 调度事件<select name="event_type" required>{% for status in contract_statuses %}<option>{{ status }}</option>{% endfor %}<option>离职</option><option>其他</option></select></label><label>事件日期<input type="date" name="event_date" value="{{ today }}" required></label><label>备注<textarea name="note" rows="3" placeholder="选填"></textarea></label><div class="rule-note"><strong>自动联动</strong><span>“工人入境”写入合同开始日并累计配额使用次数；“离职”累计替补次数并关闭当前周期。</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">保存</button></div></form></dialog>
+
+  <nav class="mobile-nav" aria-label="移动端导航"><a href="{{ url_for('index') }}">工作台</a><a href="{{ url_for('people_page') }}">人员</a><a href="{{ url_for('contracts_page') }}">合同</a><a href="{{ url_for('quotas_page') }}">名额</a><a href="{{ url_for('tasks_page') }}">更多</a></nav>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='workbench.js') }}"></script>
+</body>
+</html>

@@ -1,0 +1,67 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <script>if (location.protocol === 'file:') location.replace('http://127.0.0.1:5001/');</script>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>{{ quota.display_label }} · Labour OS</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='operator.css') }}">
+</head>
+<body>
+  <aside class="sidebar">
+    <a class="brand brand-link" href="{{ url_for('index') }}"><span>LO</span>Labour OS</a>
+    <nav>
+      <a class="nav-item" href="{{ url_for('index') }}">总览</a>
+      <a class="nav-item" href="{{ url_for('contracts_page') }}">合同管理</a>
+      <a class="nav-item active" href="{{ url_for('quotas_page') }}">名额管理</a>
+      <a class="nav-item" href="{{ url_for('people_page') }}">人员管理</a>
+      <a class="nav-item" href="{{ url_for('risks_page') }}">风险中心</a>
+      <a class="nav-item" href="{{ url_for('tasks_page') }}">任务提醒</a>
+    </nav>
+  </aside>
+
+  <main class="app-shell detail-shell">
+    <header class="detail-topbar">
+      <div><a class="back-link" href="{{ url_for('quotas_page') }}">← 返回配额列表</a><h1>{{ quota.display_label }}</h1><p>{{ quota.company_name }} · {{ quota.quota_type }}</p></div>
+      <div class="actions"><button class="button secondary" data-open="quota-details-dialog">补充资料</button><button class="button primary" data-open="assign-dialog">{{ '替补人员' if quota.person_name else '开始使用' }}</button></div>
+    </header>
+
+    {% with messages = get_flashed_messages(with_categories=true) %}
+      {% for category, message in messages %}<div class="flash {{ category }}">{{ message }}</div>{% endfor %}
+    {% endwith %}
+
+    <section class="detail-metrics">
+      <article><span>名额类型</span><strong>{{ quota.quota_type }}</strong></article>
+      <article><span>当前人员</span><strong>{{ quota.person_name or '暂无' }}</strong></article>
+      <article><span>累计使用</span><strong>{{ quota.used_months }} 个月</strong></article>
+      <article><span>剩余额度</span><strong class="quota-remaining {{ 'quota-empty' if quota.remaining_months == 0 }}">{{ quota.remaining_months }} 个月</strong></article>
+      <article><span>调度状态</span><strong>{{ quota.status }}</strong></article>
+      <article><span>替补次数</span><strong>{{ quota.replacement_count }} / {{ quota.max_replacement_count }}</strong></article>
+    </section>
+
+    <section class="panel detail-panel">
+      <div class="panel-head"><div><h2>配额资料</h2><p>缺失内容可随业务推进后补</p></div><button class="text-button" data-open="quota-details-dialog">编辑资料</button></div>
+      <dl class="detail-list"><div><dt>批文号</dt><dd>{{ quota.approval_number or '待补充' }}</dd></div><div><dt>配额序号</dt><dd>{{ quota.quota_serial or '待补充' }}</dd></div><div><dt>开始日期</dt><dd>{{ quota.start_date or '待补充' }}</dd></div><div><dt>批文有效期</dt><dd>{{ quota.expiry_date or '待补充' }}</dd></div><div><dt>入境使用次数</dt><dd>{{ quota.usage_count }}</dd></div><div><dt>替补上限</dt><dd>{{ quota.max_replacement_count }} 次（{{ quota.quota_type }}）</dd></div></dl>
+    </section>
+
+    <section class="panel detail-panel usage-panel">
+      <div class="panel-head"><div><h2>使用情况</h2><p>{{ quota.calculation_label }}，任意剩余天数向上计为1个月</p></div></div>
+      <div class="table-wrap"><table><thead><tr><th>使用人员</th><th>开始日期</th><th>结束日期</th><th>计费时长</th><th>记录状态</th></tr></thead><tbody>
+        {% for usage in quota.history %}<tr><td class="name">{{ usage.person_name }}</td><td>{{ usage.start_date }}</td><td>{{ usage.end_date or '使用中' }}</td><td>{{ usage.months }} 个月</td><td><span class="status {{ 'available' if usage.end_date }}">{{ '已结束' if usage.end_date else '当前使用' }}</span></td></tr>
+        {% else %}<tr><td colspan="5" class="empty">暂无使用记录，点击“开始使用”分配人员。</td></tr>{% endfor %}
+      </tbody></table></div>
+    </section>
+
+    <div class="detail-grid detail-related">
+      <section class="panel detail-panel"><div class="panel-head"><div><h2>关联流程</h2><p>{{ related.workflows|length }} 条</p></div></div><div class="compact-list">{% for workflow in related.workflows %}<article><div><strong>{{ workflow.workflow_code }}</strong><p>{{ workflow.person_name }} · {{ workflow.current_step }}</p></div><small>{{ workflow.status }}</small></article>{% else %}<p class="empty-block">暂无关联流程。</p>{% endfor %}</div></section>
+      <section class="panel detail-panel"><div class="panel-head"><div><h2>风险与资料</h2><p>当前名额关联数据</p></div><a class="text-link" href="{{ url_for('risks_page') }}">查看风险</a></div><dl class="detail-list"><div><dt>风险</dt><dd>{{ related.risks|length }} 项</dd></div><div><dt>资料</dt><dd>{{ related.documents|length }} 份</dd></div><div><dt>使用记录</dt><dd>{{ quota.history|length }} 条</dd></div></dl></section>
+    </div>
+  </main>
+
+  <dialog id="quota-details-dialog"><form method="post" action="{{ url_for('update_quota_details', quota_id=quota.id) }}"><div class="modal-head"><div><h2>补充配额资料</h2><p>仅配额类型和公司名必填</p></div><button type="button" data-close>×</button></div><label>配额类型<select name="quota_type" required><option {{ 'selected' if quota.quota_type == 'SWD' }}>SWD</option><option {{ 'selected' if quota.quota_type == 'LD' }}>LD</option></select></label><label>公司名<input name="company_name" required value="{{ quota.company_name }}"></label><div class="optional-section"><strong>可选字段</strong><span>可分阶段补充</span></div><label>批文号 <span class="optional">（可选）</span><input name="approval_number" value="{{ quota.approval_number or '' }}"></label><label>配额序号 <span class="optional">（可选）</span><input name="quota_serial" value="{{ quota.quota_serial or '' }}"></label><label>使用人 <span class="optional">（可选）</span><select name="assigned_user"><option value="">暂不分配</option>{% for person in people %}<option value="{{ person.id }}" {{ 'selected' if quota.person_id == person.id }}>{{ person.name }}</option>{% endfor %}</select></label><label>批文有效期 <span class="optional">（可选）</span><input type="date" name="expiry_date" value="{{ quota.expiry_date or '' }}"></label><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">保存资料</button></div></form></dialog>
+
+  <dialog id="assign-dialog"><form method="post" action="{{ url_for('assign_quota', quota_id=quota.id) }}"><input type="hidden" name="return_to" value="detail"><div class="modal-head"><div><h2>更换使用人</h2><p>{{ quota.display_label }} · {{ quota.quota_type }}</p></div><button type="button" data-close>×</button></div><label>新使用人<select name="person_id" required><option value="">请选择人员</option>{% for person in people %}<option value="{{ person.id }}">{{ person.name }}</option>{% endfor %}</select></label><label>离职 / 替补日期<input type="date" name="start_date" value="{{ today }}" required></label><div class="rule-note"><strong>统一调度规则</strong><span>替补会结束旧周期并生成新合同周期；新周期只有记录“工人入境”事件后才开始占用名额。</span></div><div class="modal-actions"><button type="button" class="button secondary" data-close>取消</button><button class="button primary">确认替补</button></div></form></dialog>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+</body>
+</html>
