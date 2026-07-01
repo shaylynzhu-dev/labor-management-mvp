@@ -1,5 +1,7 @@
 from datetime import date, datetime, timedelta
 import calendar
+import hashlib
+import json
 from pathlib import Path
 import mimetypes
 import re
@@ -27,6 +29,17 @@ DOCUMENT_TYPES = {
 BASE_REQUIRED_DOCUMENTS = ("resume", "contract", "mainland_id", "hkmo_permit")
 CONTRACT_RESTART_LEAD_DAYS = 30
 DOCUMENT_COLLECTION_LEAD_MONTHS = 1
+DATA_PRECEDENCE_ORDER = (
+    "manual_input",
+    "confirmed_binding",
+    "folder_recognition",
+    "filename_recognition",
+    "excel_import",
+    "auto_inference",
+)
+DATA_PRECEDENCE_RANK = {source: index + 1 for index, source in enumerate(DATA_PRECEDENCE_ORDER)}
+CASE_LIFECYCLE = ("active", "completed", "archived", "frozen")
+HUMAN_REVIEW_STATUS = "human_review_required"
 
 
 def _value(person, key):
@@ -89,13 +102,74 @@ def suggest_person_by_filename(db, filename):
     return candidates
 
 
+def data_precedence_rank(source):
+    return DATA_PRECEDENCE_RANK.get(source or "auto_inference", DATA_PRECEDENCE_RANK["auto_inference"])
+
+
+def choose_higher_precedence(current_source, incoming_source):
+    return incoming_source if data_precedence_rank(incoming_source) <= data_precedence_rank(current_source) else current_source
+
+
+def queue_conflict(db, conflict_type, entity_type, payload, entity_id=None, source="auto_inference"):
+    db.execute(
+        """INSERT INTO conflict_queue
+           (entity_type,entity_id,conflict_type,status,source,data_precedence_rank,payload)
+           VALUES (?,?,?,?,?,?,?)""",
+        (entity_type, entity_id, conflict_type, HUMAN_REVIEW_STATUS,
+         source, data_precedence_rank(source), json.dumps(payload or {}, ensure_ascii=False)),
+    )
+
+
+def queue_retry(db, operation, entity_type, filename, reason, payload=None, entity_id=None):
+    db.execute(
+        """INSERT INTO retry_queue
+           (operation,entity_type,entity_id,filename,reason,payload,status)
+           VALUES (?,?,?,?,?,?,?)""",
+        (operation, entity_type, entity_id, filename, reason,
+         json.dumps(payload or {}, ensure_ascii=False), "pending"),
+    )
+
+
+def next_case_status(current_status, target_status):
+    if target_status not in CASE_LIFECYCLE:
+        raise ValueError("办理周期状态无效")
+    if not current_status:
+        return target_status
+    if current_status not in CASE_LIFECYCLE:
+        return target_status
+    if CASE_LIFECYCLE.index(target_status) < CASE_LIFECYCLE.index(current_status):
+        raise ValueError("办理周期不能回退状态")
+    return target_status
+
+
+def document_hash_from_path(path):
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
+def find_duplicate_document(db, document_hash, original_filename, person_id, person_case_id):
+    return db.execute(
+        """SELECT * FROM person_documents
+           WHERE is_deleted=0 AND document_hash=? AND original_filename=? AND person_id=?
+             AND COALESCE(person_case_id,0)=COALESCE(?,0)
+           ORDER BY version_no DESC,id DESC LIMIT 1""",
+        (document_hash, original_filename, person_id, person_case_id),
+    ).fetchone()
+
+
 def suggest_case_for_document(person, file_info):
     """Return a case suggestion without ever using the person's name as evidence."""
     cases = [dict(item) for item in file_info.get("cases", [])]
     manual_case_id = file_info.get("person_case_id")
     if manual_case_id:
         matched = next((item for item in cases if item["id"] == int(manual_case_id)), None)
-        return {"case": matched, "confidence": 1.0, "status": "confirmed"} if matched else None
+        return {
+            "case": matched, "confidence": 1.0, "status": "confirmed",
+            "source": "manual_input", "conflict_type": None,
+        } if matched else None
     text = " ".join(filter(None, [file_info.get("folder_name"), file_info.get("filename")])).lower()
     normalized = text.replace("–", "-").replace("—", "-")
     type_tokens = {
@@ -120,11 +194,27 @@ def suggest_case_for_document(person, file_info):
             scored.append((score, case))
     scored.sort(key=lambda item: item[0], reverse=True)
     if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
-        return {"case": scored[0][1], "confidence": scored[0][0], "status": "suggested"}
+        source = "folder_recognition" if any(token in (file_info.get("folder_name") or "").lower() for token in ("新人", "首次", "新合约", "续约", "替补", "24个月")) else "filename_recognition"
+        return {
+            "case": scored[0][1], "confidence": scored[0][0], "status": "suggested",
+            "source": source, "conflict_type": None,
+        }
+    if len(scored) > 1 and scored[0][0] == scored[1][0]:
+        return {
+            "case": None, "confidence": scored[0][0], "status": "unassigned",
+            "source": "auto_inference", "conflict_type": "multiple_case_match",
+        }
     active = [item for item in cases if item["status"] == "active"]
     if len(active) == 1:
-        return {"case": active[0], "confidence": 0.55, "status": "suggested"}
-    return {"case": None, "confidence": 0.0, "status": "unassigned"}
+        return {
+            "case": active[0], "confidence": 0.55, "status": "suggested",
+            "source": "auto_inference", "conflict_type": None,
+        }
+    return {
+        "case": None, "confidence": 0.0, "status": "unassigned",
+        "source": "auto_inference",
+        "conflict_type": "multiple_case_match" if len(active) > 1 else "unclassified_document",
+    }
 
 
 def _parse_date(value):
@@ -227,6 +317,10 @@ def save_person_document_batch(
         if extension not in allowed:
             result["skipped"] += 1
             result["errors"].append({"filename": original, "reason": "不支持的文件格式"})
+            queue_retry(
+                db, "manual_fix", "person_document", original, "不支持的文件格式",
+                {"person_id": person_id, "batch_id": batch_id, "document_type": document_type},
+            )
             continue
         safe_name = secure_filename(original) or f"document.{extension}"
         stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
@@ -248,25 +342,50 @@ def save_person_document_batch(
                         raise ValueError("单文件超过25MB")
                     output.write(chunk)
             relative_path = destination.relative_to(Path(upload_root)).as_posix()
+            document_hash = document_hash_from_path(destination)
+            suggested_case_id = suggestion["case"]["id"] if suggestion and suggestion["case"] else None
+            duplicate = find_duplicate_document(db, document_hash, original, person_id, suggested_case_id)
+            version_no = int(duplicate["version_no"] or 1) + 1 if duplicate else 1
+            binding_status = suggestion["status"] if suggestion else "unassigned"
+            document_status = "duplicate" if duplicate else (
+                HUMAN_REVIEW_STATUS if binding_status == "unassigned" else "active"
+            )
             db.execute(
                 """INSERT INTO person_documents
                    (person_id,document_type,original_filename,stored_path,mime_type,
                     file_size,upload_batch_id,status,remarks,person_case_id,
-                    inferred_case_confidence,case_binding_status)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    inferred_case_confidence,case_binding_status,document_hash,
+                    duplicate_of_document_id,version_no,binding_source,data_source,
+                    data_precedence_rank)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (person_id, document_type, original, relative_path,
                  uploaded.mimetype or mimetypes.guess_type(original)[0] or "application/octet-stream",
-                 size, batch_id, "active", remarks,
-                 suggestion["case"]["id"] if suggestion and suggestion["case"] else None,
-                 suggestion["confidence"] if suggestion else 0.0,
-                 suggestion["status"] if suggestion else "unassigned"),
+                 size, batch_id, document_status, remarks, suggested_case_id,
+                 suggestion["confidence"] if suggestion else 0.0, binding_status,
+                 document_hash, duplicate["id"] if duplicate else None, version_no,
+                 suggestion["source"] if suggestion else "auto_inference",
+                 suggestion["source"] if suggestion else "auto_inference",
+                 data_precedence_rank(suggestion["source"] if suggestion else "auto_inference")),
             )
+            document_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
+            if duplicate:
+                result["duplicates"] = result.get("duplicates", 0) + 1
+            if suggestion and suggestion.get("conflict_type"):
+                queue_conflict(
+                    db, suggestion["conflict_type"], "person_document",
+                    {"filename": original, "person_id": person_id, "batch_id": batch_id},
+                    document_id, suggestion.get("source"),
+                )
             result["success"] += 1
         except Exception as error:
             if destination.exists():
                 destination.unlink()
             result["failed"] += 1
             result["errors"].append({"filename": original, "reason": str(error)})
+            queue_retry(
+                db, "upload", "person_document", original, str(error),
+                {"person_id": person_id, "batch_id": batch_id, "document_type": document_type},
+            )
     db.commit()
     return result
 
@@ -311,6 +430,8 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
         document["document_type_label"] = DOCUMENT_TYPES.get(document["document_type"], "其他")
         document["is_expired"] = bool(document.get("expiry_date") and document["expiry_date"] < today)
         document["file_size_label"] = _file_size_label(document.get("file_size"))
+        document["is_duplicate"] = document.get("status") == "duplicate"
+        document["needs_human_review"] = document.get("status") == HUMAN_REVIEW_STATUS
     document_groups = []
     for document_type, label in DOCUMENT_TYPES.items():
         items = [item for item in documents if item["document_type"] == document_type]

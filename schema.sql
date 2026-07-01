@@ -22,6 +22,8 @@ CREATE TABLE IF NOT EXISTS person (
     visa_status TEXT NULL,
     hk_id_appointment_status TEXT NULL,
     remarks TEXT NULL,
+    data_source TEXT NOT NULL DEFAULT 'manual_input',
+    data_precedence_rank INTEGER NOT NULL DEFAULT 1,
     is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
     deleted_at DATETIME NULL,
     deleted_by INTEGER NULL,
@@ -40,6 +42,12 @@ CREATE TABLE IF NOT EXISTS person_documents (
     person_case_id INTEGER NULL,
     inferred_case_confidence REAL NULL,
     case_binding_status TEXT NOT NULL DEFAULT 'unassigned',
+    document_hash TEXT NULL,
+    duplicate_of_document_id INTEGER NULL,
+    version_no INTEGER NOT NULL DEFAULT 1,
+    binding_source TEXT NOT NULL DEFAULT 'auto_inference',
+    data_source TEXT NOT NULL DEFAULT 'auto_inference',
+    data_precedence_rank INTEGER NOT NULL DEFAULT 6,
     ocr_text TEXT NOT NULL DEFAULT '',
     issue_date DATE NULL,
     expiry_date DATE NULL,
@@ -50,7 +58,8 @@ CREATE TABLE IF NOT EXISTS person_documents (
     deleted_at DATETIME NULL,
     deleted_by INTEGER NULL,
     FOREIGN KEY(person_id) REFERENCES person(id) ON DELETE RESTRICT,
-    FOREIGN KEY(person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL
+    FOREIGN KEY(person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL,
+    FOREIGN KEY(duplicate_of_document_id) REFERENCES person_documents(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS person_cases (
@@ -69,6 +78,9 @@ CREATE TABLE IF NOT EXISTS person_cases (
     quota_id INTEGER NULL,
     contract_id INTEGER NULL,
     status TEXT NOT NULL DEFAULT 'active',
+    lifecycle_status TEXT NOT NULL DEFAULT 'active',
+    data_source TEXT NOT NULL DEFAULT 'manual_input',
+    data_precedence_rank INTEGER NOT NULL DEFAULT 1,
     remarks TEXT NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
@@ -79,6 +91,50 @@ CREATE TABLE IF NOT EXISTS person_cases (
     FOREIGN KEY(quota_id) REFERENCES quota(id) ON DELETE SET NULL,
     FOREIGN KEY(contract_id) REFERENCES contract(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS conflict_queue (
+    id INTEGER PRIMARY KEY,
+    entity_type TEXT NOT NULL,
+    entity_id INTEGER NULL,
+    conflict_type TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'human_review_required',
+    source TEXT NOT NULL DEFAULT 'auto_inference',
+    data_precedence_rank INTEGER NOT NULL DEFAULT 6,
+    payload TEXT NOT NULL DEFAULT '{}',
+    resolution TEXT NULL,
+    resolved_by INTEGER NULL,
+    resolved_at DATETIME NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS retry_queue (
+    id INTEGER PRIMARY KEY,
+    operation TEXT NOT NULL,
+    entity_type TEXT NOT NULL,
+    entity_id INTEGER NULL,
+    filename TEXT NULL,
+    reason TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}',
+    status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    last_retry_at DATETIME NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS data_precedence_rules (
+    source TEXT PRIMARY KEY,
+    rank INTEGER NOT NULL UNIQUE,
+    label TEXT NOT NULL
+);
+
+INSERT OR IGNORE INTO data_precedence_rules(source,rank,label) VALUES
+('manual_input', 1, '手动输入'),
+('confirmed_binding', 2, '已确认绑定'),
+('folder_recognition', 3, '文件夹识别'),
+('filename_recognition', 4, '文件名识别'),
+('excel_import', 5, 'Excel导入'),
+('auto_inference', 6, '自动推断');
 
 CREATE TABLE IF NOT EXISTS quota (
     id INTEGER PRIMARY KEY,
@@ -179,3 +235,9 @@ CREATE INDEX IF NOT EXISTS idx_event_contract ON event(contract_id, created_at);
 CREATE INDEX IF NOT EXISTS idx_risk_status ON risk(status, risk_type);
 CREATE UNIQUE INDEX IF NOT EXISTS idx_risk_quota_expiry_open
     ON risk(quota_id, risk_type) WHERE status = 'open';
+CREATE INDEX IF NOT EXISTS idx_person_documents_hash
+    ON person_documents(document_hash, original_filename, person_id, person_case_id);
+CREATE INDEX IF NOT EXISTS idx_conflict_queue_status
+    ON conflict_queue(status, conflict_type, created_at);
+CREATE INDEX IF NOT EXISTS idx_retry_queue_status
+    ON retry_queue(status, entity_type, created_at);

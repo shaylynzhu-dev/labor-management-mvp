@@ -24,7 +24,9 @@ from app.services.dispatch_engine import (
     transition_contract, trigger_worker_departure,
 )
 from app.services.person_profile_service import (
-    DOCUMENT_TYPES, calculate_renewal_alert_dates, get_person_profile, save_person_document_batch,
+    DOCUMENT_TYPES, HUMAN_REVIEW_STATUS, calculate_renewal_alert_dates,
+    get_person_profile, save_person_document_batch,
+    document_hash_from_path, find_duplicate_document, queue_conflict, queue_retry,
     suggest_case_for_document, suggest_person_by_filename,
 )
 
@@ -825,6 +827,8 @@ def init_db():
             introducer TEXT,
             id_last4 TEXT CHECK(id_last4 IS NULL OR length(id_last4) = 4),
             permit_last4 TEXT CHECK(permit_last4 IS NULL OR length(permit_last4) = 4),
+            data_source TEXT NOT NULL DEFAULT 'manual_input',
+            data_precedence_rank INTEGER NOT NULL DEFAULT 1,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -978,6 +982,9 @@ def init_db():
             quota_id INTEGER,
             contract_id TEXT,
             status TEXT NOT NULL DEFAULT 'active',
+            lifecycle_status TEXT NOT NULL DEFAULT 'active',
+            data_source TEXT NOT NULL DEFAULT 'manual_input',
+            data_precedence_rank INTEGER NOT NULL DEFAULT 1,
             remarks TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
@@ -1001,6 +1008,12 @@ def init_db():
             person_case_id INTEGER,
             inferred_case_confidence REAL,
             case_binding_status TEXT NOT NULL DEFAULT 'unassigned',
+            document_hash TEXT,
+            duplicate_of_document_id INTEGER,
+            version_no INTEGER NOT NULL DEFAULT 1,
+            binding_source TEXT NOT NULL DEFAULT 'auto_inference',
+            data_source TEXT NOT NULL DEFAULT 'auto_inference',
+            data_precedence_rank INTEGER NOT NULL DEFAULT 6,
             ocr_text TEXT NOT NULL DEFAULT '',
             issue_date TEXT,
             expiry_date TEXT,
@@ -1011,7 +1024,44 @@ def init_db():
             deleted_at DATETIME,
             deleted_by INTEGER,
             FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE RESTRICT,
-            FOREIGN KEY (person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL
+            FOREIGN KEY (person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL,
+            FOREIGN KEY (duplicate_of_document_id) REFERENCES person_documents(id) ON DELETE SET NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS conflict_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            conflict_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'human_review_required',
+            source TEXT NOT NULL DEFAULT 'auto_inference',
+            data_precedence_rank INTEGER NOT NULL DEFAULT 6,
+            payload TEXT NOT NULL DEFAULT '{}',
+            resolution TEXT,
+            resolved_by INTEGER,
+            resolved_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS retry_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            filename TEXT,
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_retry_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+
+        CREATE TABLE IF NOT EXISTS data_precedence_rules (
+            source TEXT PRIMARY KEY,
+            rank INTEGER NOT NULL UNIQUE,
+            label TEXT NOT NULL
         );
 
         CREATE TABLE IF NOT EXISTS lifecycle_nodes (
@@ -1101,6 +1151,12 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_documents_binding ON documents(person_id, quota_id, workflow_id);
         CREATE INDEX IF NOT EXISTS idx_person_documents_person ON person_documents(person_id,is_deleted);
         CREATE INDEX IF NOT EXISTS idx_person_documents_type ON person_documents(document_type,status);
+        CREATE INDEX IF NOT EXISTS idx_person_documents_hash
+            ON person_documents(document_hash,original_filename,person_id,person_case_id);
+        CREATE INDEX IF NOT EXISTS idx_conflict_queue_status
+            ON conflict_queue(status,conflict_type,created_at);
+        CREATE INDEX IF NOT EXISTS idx_retry_queue_status
+            ON retry_queue(status,entity_type,created_at);
         CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflow_instances(status);
         CREATE INDEX IF NOT EXISTS idx_lifecycle_due ON lifecycle_nodes(due_date, status);
         CREATE INDEX IF NOT EXISTS idx_risks_level ON risks(risk_level, status);
@@ -1141,6 +1197,8 @@ def init_db():
                     introducer TEXT,
                     id_last4 TEXT CHECK(id_last4 IS NULL OR length(id_last4) = 4),
                     permit_last4 TEXT CHECK(permit_last4 IS NULL OR length(permit_last4) = 4),
+                    data_source TEXT NOT NULL DEFAULT 'manual_input',
+                    data_precedence_rank INTEGER NOT NULL DEFAULT 1,
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
                 )
                 """
@@ -1149,10 +1207,12 @@ def init_db():
                 f"""
                 INSERT INTO people_new
                     (id, name, gender, company_name, introducer,
-                     id_last4, permit_last4, created_at)
+                     id_last4, permit_last4, data_source, data_precedence_rank, created_at)
                 SELECT id, name, {select_value('gender')},
                        {select_value('company_name')}, {select_value('introducer')},
                        {select_value('id_last4')}, {select_value('permit_last4')},
+                       COALESCE({select_value('data_source')}, 'manual_input'),
+                       COALESCE({select_value('data_precedence_rank')}, 1),
                        created_at
                 FROM people
                 """
@@ -1182,6 +1242,8 @@ def init_db():
         "entry_permit_no": "TEXT", "hk_submission_date": "TEXT",
         "visa_status_date": "TEXT", "visa_status": "TEXT",
         "hk_id_appointment_status": "TEXT", "remarks": "TEXT",
+        "data_source": "TEXT NOT NULL DEFAULT 'manual_input'",
+        "data_precedence_rank": "INTEGER NOT NULL DEFAULT 1",
     }
     current_person_columns = {
         row["name"] for row in db.execute("PRAGMA table_info(people)").fetchall()
@@ -1198,6 +1260,11 @@ def init_db():
         "upload_batch_id": "TEXT", "person_case_id": "INTEGER",
         "inferred_case_confidence": "REAL",
         "case_binding_status": "TEXT NOT NULL DEFAULT 'unassigned'",
+        "document_hash": "TEXT", "duplicate_of_document_id": "INTEGER",
+        "version_no": "INTEGER NOT NULL DEFAULT 1",
+        "binding_source": "TEXT NOT NULL DEFAULT 'auto_inference'",
+        "data_source": "TEXT NOT NULL DEFAULT 'auto_inference'",
+        "data_precedence_rank": "INTEGER NOT NULL DEFAULT 6",
     }.items():
         if column not in person_document_columns:
             db.execute(f"ALTER TABLE person_documents ADD COLUMN {column} {definition}")
@@ -1209,9 +1276,62 @@ def init_db():
         "contract_restart_due_date": "TEXT", "endorsement_expiry_date": "TEXT",
         "document_collection_due_date": "TEXT",
         "renewal_alert_status": "TEXT NOT NULL DEFAULT 'pending'",
+        "lifecycle_status": "TEXT NOT NULL DEFAULT 'active'",
+        "data_source": "TEXT NOT NULL DEFAULT 'manual_input'",
+        "data_precedence_rank": "INTEGER NOT NULL DEFAULT 1",
     }.items():
         if column not in person_case_columns:
             db.execute(f"ALTER TABLE person_cases ADD COLUMN {column} {definition}")
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS conflict_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            conflict_type TEXT NOT NULL,
+            status TEXT NOT NULL DEFAULT 'human_review_required',
+            source TEXT NOT NULL DEFAULT 'auto_inference',
+            data_precedence_rank INTEGER NOT NULL DEFAULT 6,
+            payload TEXT NOT NULL DEFAULT '{}',
+            resolution TEXT,
+            resolved_by INTEGER,
+            resolved_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS retry_queue (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            operation TEXT NOT NULL,
+            entity_type TEXT NOT NULL,
+            entity_id INTEGER,
+            filename TEXT,
+            reason TEXT NOT NULL,
+            payload TEXT NOT NULL DEFAULT '{}',
+            status TEXT NOT NULL DEFAULT 'pending',
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            last_retry_at TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        )"""
+    )
+    db.execute(
+        """CREATE TABLE IF NOT EXISTS data_precedence_rules (
+            source TEXT PRIMARY KEY,
+            rank INTEGER NOT NULL UNIQUE,
+            label TEXT NOT NULL
+        )"""
+    )
+    db.executemany(
+        "INSERT OR IGNORE INTO data_precedence_rules(source,rank,label) VALUES (?,?,?)",
+        (
+            ("manual_input", 1, "手动输入"),
+            ("confirmed_binding", 2, "已确认绑定"),
+            ("folder_recognition", 3, "文件夹识别"),
+            ("filename_recognition", 4, "文件名识别"),
+            ("excel_import", 5, "Excel导入"),
+            ("auto_inference", 6, "自动推断"),
+        ),
+    )
     for table, additions in {
         "risks": {"person_case_id": "INTEGER", "due_date": "TEXT"},
         "tasks": {"person_case_id": "INTEGER"},
@@ -1225,6 +1345,15 @@ def init_db():
     )
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_person_cases_person ON person_cases(person_id,status,is_deleted)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_person_documents_hash ON person_documents(document_hash,original_filename,person_id,person_case_id)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_conflict_queue_status ON conflict_queue(status,conflict_type,created_at)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_retry_queue_status ON retry_queue(status,entity_type,created_at)"
     )
     db.execute(
         """UPDATE people SET person_name=COALESCE(NULLIF(person_name,''),name),
@@ -2260,7 +2389,7 @@ def index(default_view="overview"):
           AND (?='' OR d.original_filename LIKE ? OR d.ocr_text LIKE ?
                OR p.name LIKE ? OR p.company_name LIKE ?)
           AND (?='' OR (?='current' AND pc.status='active' AND d.case_binding_status='confirmed')
-                    OR (?='history' AND pc.status IN ('completed','archived') AND d.case_binding_status='confirmed')
+                    OR (?='history' AND pc.status IN ('completed','archived','frozen') AND d.case_binding_status='confirmed')
                     OR (?='unbound_person' AND d.person_id IS NULL)
                     OR (?='unconfirmed' AND (d.person_case_id IS NULL OR d.case_binding_status!='confirmed')))
         ORDER BY d.uploaded_at DESC,d.id DESC
@@ -2733,7 +2862,8 @@ def update_person_profile(person_id):
     db.execute(
         f"""UPDATE people SET name=?,person_name=?,gender=?,worker_type=?,
                    {','.join(f'{field}=?' for field in fields)},
-                   id_last4=?,permit_last4=? WHERE id=?""",
+                   id_last4=?,permit_last4=?,data_source='manual_input',
+                   data_precedence_rank=1 WHERE id=?""",
         (
             name, name, gender, worker_type, *values,
             (request.form.get("mainland_id_last4") or "").strip() or None,
@@ -2755,7 +2885,7 @@ def create_person_case(person_id):
     case_type = request.form.get("case_type", "other")
     status = request.form.get("status", "active")
     case_label = request.form.get("case_label", "").strip()
-    if case_type not in {"new_contract", "renewal", "replacement", "other"} or status not in {"active", "completed", "archived"} or not case_label:
+    if case_type not in {"new_contract", "renewal", "replacement", "other"} or status not in {"active", "completed", "archived", "frozen"} or not case_label:
         flash("办理周期类型、名称或状态无效。", "error")
         return redirect(url_for("person_detail", person_id=person_id))
     contract_start_date = request.form.get("contract_start_date") or request.form.get("start_date") or None
@@ -2769,14 +2899,15 @@ def create_person_case(person_id):
         """INSERT INTO person_cases
            (person_id,case_type,case_label,start_date,end_date,contract_start_date,
             contract_end_date,contract_restart_due_date,endorsement_expiry_date,
-            document_collection_due_date,quota_id,contract_id,status,remarks)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            document_collection_due_date,quota_id,contract_id,status,lifecycle_status,
+            data_source,data_precedence_rank,remarks)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (person_id, case_type, case_label,
          request.form.get("start_date") or None, request.form.get("end_date") or None,
          contract_start_date, contract_end_date, calculated["contract_restart_due_date"],
          endorsement_expiry_date, calculated["document_collection_due_date"],
          request.form.get("quota_id") or None, request.form.get("contract_id") or None,
-         status, request.form.get("remarks") or None),
+         status, status, "manual_input", 1, request.form.get("remarks") or None),
     )
     db.commit()
     flash("办理周期已创建。", "success")
@@ -2881,8 +3012,9 @@ def upload_person_excel():
                 else:
                     cursor = db.execute(
                         """INSERT INTO people
-                           (name, gender, company_name, introducer, id_last4, permit_last4)
-                           VALUES (?, ?, ?, ?, ?, ?)""",
+                           (name, gender, company_name, introducer, id_last4, permit_last4,
+                            data_source,data_precedence_rank)
+                           VALUES (?, ?, ?, ?, ?, ?, 'excel_import', 5)""",
                         (name, gender, company_name, introducer, id_last4, permit_last4),
                     )
                     db.execute(
@@ -3847,7 +3979,20 @@ def upload_document():
         ).fetchall()
         if len(matches) == 1:
             person_id = str(matches[0]["id"])
+        elif len(matches) > 1:
+            queue_conflict(
+                db, "multiple_person_match", "person_document",
+                {"filename": uploaded.filename, "candidate_ids": [row["id"] for row in matches]},
+                source="filename_recognition",
+            )
+            db.commit()
     if not uploaded or not uploaded.filename or not title or not person_id:
+        if uploaded and uploaded.filename:
+            queue_retry(
+                db, "rebind_person", "person_document", uploaded.filename,
+                "文件必须绑定具体人员", {"title": title, "document_type": document_type},
+            )
+            db.commit()
         flash("文件必须绑定具体人员。", "error")
         return redirect(url_for("index", view="documents"))
     if document_type not in DOCUMENT_TYPES:
@@ -3871,6 +4016,9 @@ def upload_document():
     stored_name = f"{uuid.uuid4().hex}_{filename}"
     path = Path(app.config["UPLOAD_FOLDER"]) / stored_name
     uploaded.save(path)
+    document_hash = document_hash_from_path(path)
+    duplicate = find_duplicate_document(db, document_hash, original_filename, person_id, None)
+    version_no = int(duplicate["version_no"] or 1) + 1 if duplicate else 1
     if manual_text:
         ocr_text, ocr_status = manual_text, "人工补录"
     else:
@@ -3882,10 +4030,13 @@ def upload_document():
     db.execute(
         """INSERT INTO person_documents
            (person_id,document_type,original_filename,stored_path,ocr_text,
-            issue_date,expiry_date,status,remarks)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+            issue_date,expiry_date,status,remarks,document_hash,duplicate_of_document_id,
+            version_no,binding_source,data_source,data_precedence_rank)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (person_id, document_type, original_filename, stored_name, ocr_text, issue_date,
-         expiry_date, "pending_ocr" if ocr_status == "待OCR" else "active", remarks),
+         expiry_date, "duplicate" if duplicate else ("pending_ocr" if ocr_status == "待OCR" else HUMAN_REVIEW_STATUS),
+         remarks, document_hash, duplicate["id"] if duplicate else None, version_no,
+         "manual_input", "manual_input", 1),
     )
     if quota_id and workflow_id:
         valid_quota = db.execute(
@@ -3987,11 +4138,17 @@ def confirm_person_document_case(document_id):
     ).fetchone():
         flash("选择的办理周期无效。", "error")
     else:
+        binding_source = "confirmed_binding" if person_case_id else "manual_input"
+        precedence_rank = 2 if person_case_id else 1
         db.execute(
             """UPDATE person_documents SET person_case_id=?,case_binding_status=?,
-                      inferred_case_confidence=? WHERE id=?""",
+                      inferred_case_confidence=?,binding_source=?,
+                      data_source=?,data_precedence_rank=?,
+                      status=CASE WHEN status='human_review_required' THEN 'active' ELSE status END
+               WHERE id=?""",
             (person_case_id or None, "confirmed" if person_case_id else "unassigned",
-             1.0 if person_case_id else 0.0, document_id),
+             1.0 if person_case_id else 0.0, binding_source, binding_source,
+             precedence_rank, document_id),
         )
         db.commit()
         flash("资料办理周期已确认。", "success")

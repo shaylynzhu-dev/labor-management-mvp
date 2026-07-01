@@ -41,10 +41,22 @@ class PersonProfileTest(unittest.TestCase):
             self.assertTrue({"mime_type", "file_size", "upload_batch_id"}.issubset(document_columns))
             self.assertTrue({
                 "person_case_id", "inferred_case_confidence", "case_binding_status",
+                "document_hash", "duplicate_of_document_id", "version_no",
+                "binding_source", "data_source", "data_precedence_rank",
             }.issubset(document_columns))
             self.assertIsNotNone(db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='person_cases'"
             ).fetchone())
+            self.assertIsNotNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='conflict_queue'"
+            ).fetchone())
+            self.assertIsNotNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='retry_queue'"
+            ).fetchone())
+            self.assertEqual(
+                db.execute("SELECT rank FROM data_precedence_rules WHERE source='manual_input'").fetchone()[0],
+                1,
+            )
 
             person = {
                 "worker_type": "new", "mainland_id_first4": "1234",
@@ -118,6 +130,60 @@ class PersonProfileTest(unittest.TestCase):
                 (row["person_case_id"], row["case_binding_status"]),
                 (case_id, "confirmed"),
             )
+
+    def test_batch_upload_duplicate_and_unclassified_go_to_control_queues(self):
+        with app.app_context():
+            db = get_db()
+            person_id = db.execute(
+                "INSERT INTO people(name,person_name,gender) VALUES ('重复人员','重复人员','男')"
+            ).lastrowid
+            active_one = db.execute(
+                "INSERT INTO person_cases(person_id,case_type,case_label,status) VALUES (?,?,?,?)",
+                (person_id, "renewal", "续约 2026-2028", "active"),
+            ).lastrowid
+            db.execute(
+                "INSERT INTO person_cases(person_id,case_type,case_label,status) VALUES (?,?,?,?)",
+                (person_id, "replacement", "替补 2026-2028", "active"),
+            )
+            db.commit()
+
+            def make_upload(name, body):
+                upload = type("Upload", (), {})()
+                upload.filename = name
+                upload.mimetype = "application/pdf"
+                upload.stream = io.BytesIO(body)
+                return upload
+
+            first = save_person_document_batch(
+                db, app.config["UPLOAD_FOLDER"], person_id,
+                [make_upload("scan001.pdf", b"same-file")], "contract",
+            )
+            second = save_person_document_batch(
+                db, app.config["UPLOAD_FOLDER"], person_id,
+                [make_upload("scan001.pdf", b"same-file")], "contract",
+            )
+            self.assertEqual(first["success"], 1)
+            self.assertEqual(second["success"], 1)
+            rows = db.execute(
+                "SELECT status,version_no,duplicate_of_document_id FROM person_documents WHERE person_id=? ORDER BY id",
+                (person_id,),
+            ).fetchall()
+            self.assertEqual(rows[0]["status"], "human_review_required")
+            self.assertEqual(rows[1]["status"], "duplicate")
+            self.assertEqual(rows[1]["version_no"], 2)
+            self.assertIsNotNone(rows[1]["duplicate_of_document_id"])
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM conflict_queue WHERE conflict_type='multiple_case_match'"
+            ).fetchone())
+
+            bad = save_person_document_batch(
+                db, app.config["UPLOAD_FOLDER"], person_id,
+                [make_upload("bad.exe", b"bad")], "contract", person_case_id=active_one,
+            )
+            self.assertEqual(bad["skipped"], 1)
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM retry_queue WHERE filename='bad.exe'"
+            ).fetchone())
 
     def test_profile_masks_entry_permit_for_non_admin(self):
         with app.app_context():
