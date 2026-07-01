@@ -56,10 +56,10 @@ def _iso_date(value, label):
 def _quota_for_contract(connection, contract):
     if contract["quota_id"]:
         return connection.execute(
-            "SELECT * FROM quotas WHERE id=?", (contract["quota_id"],)
+            "SELECT * FROM quotas WHERE id=? AND is_deleted=0", (contract["quota_id"],)
         ).fetchone()
     quota = connection.execute(
-        "SELECT * FROM quotas WHERE person_id=? ORDER BY id DESC LIMIT 1",
+        "SELECT * FROM quotas WHERE person_id=? AND is_deleted=0 ORDER BY id DESC LIMIT 1",
         (contract["person_id"],),
     ).fetchone()
     if quota:
@@ -75,7 +75,7 @@ def transition_contract(connection, contract_id, target_status, event_date=None)
     if target not in CONTRACT_LIFECYCLE:
         raise ValueError("合同生命周期状态无效")
     contract = connection.execute(
-        "SELECT * FROM contracts WHERE contract_id=?", (contract_id,)
+        "SELECT * FROM contracts WHERE contract_id=? AND is_deleted=0", (contract_id,)
     ).fetchone()
     if not contract:
         raise ValueError("合同不存在")
@@ -114,7 +114,7 @@ def transition_contract(connection, contract_id, target_status, event_date=None)
 def register_worker_entry(connection, contract_id, entry_date):
     entry = _iso_date(entry_date, "入境日期")
     contract = connection.execute(
-        "SELECT * FROM contracts WHERE contract_id=?", (contract_id,)
+        "SELECT * FROM contracts WHERE contract_id=? AND is_deleted=0", (contract_id,)
     ).fetchone()
     if not contract:
         raise ValueError("合同不存在")
@@ -162,7 +162,7 @@ def register_worker_entry(connection, contract_id, entry_date):
 def trigger_worker_departure(connection, person_id, departure_date):
     departure = _iso_date(departure_date, "离职日期")
     contract = connection.execute(
-        """SELECT * FROM contracts WHERE person_id=? AND is_replaced=0
+        """SELECT * FROM contracts WHERE person_id=? AND is_replaced=0 AND is_deleted=0
            AND status!='完成合约' ORDER BY cycle_index DESC, created_at DESC LIMIT 1""",
         (person_id,),
     ).fetchone()
@@ -201,9 +201,11 @@ def trigger_worker_departure(connection, person_id, departure_date):
 
 def create_replacement_cycle(connection, quota_id, new_person_id, replacement_date):
     start = _iso_date(replacement_date, "替补日期")
-    quota = connection.execute("SELECT * FROM quotas WHERE id=?", (quota_id,)).fetchone()
+    quota = connection.execute(
+        "SELECT * FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)
+    ).fetchone()
     person = connection.execute(
-        "SELECT id,name FROM people WHERE id=?", (new_person_id,)
+        "SELECT id,name FROM people WHERE id=? AND is_deleted=0", (new_person_id,)
     ).fetchone()
     if not quota or not person:
         raise ValueError("配额或替补人员不存在")
@@ -213,7 +215,7 @@ def create_replacement_cycle(connection, quota_id, new_person_id, replacement_da
         connection.execute("UPDATE quotas SET status='invalid' WHERE id=?", (quota_id,))
         raise ValueError("配额替补次数已超过上限")
     parent = connection.execute(
-        """SELECT * FROM contracts WHERE quota_id=? AND is_replaced=1
+        """SELECT * FROM contracts WHERE quota_id=? AND is_replaced=1 AND is_deleted=0
            ORDER BY cycle_index DESC, created_at DESC LIMIT 1""",
         (quota_id,),
     ).fetchone()
@@ -224,7 +226,7 @@ def create_replacement_cycle(connection, quota_id, new_person_id, replacement_da
         )
         return {"contract_id": None, "cycle_index": None, "initial_assignment": True}
     existing_child = connection.execute(
-        "SELECT contract_id FROM contracts WHERE parent_contract_id=?",
+        "SELECT contract_id FROM contracts WHERE parent_contract_id=? AND is_deleted=0",
         (parent["contract_id"],),
     ).fetchone()
     if existing_child:

@@ -82,10 +82,11 @@ class LabourOSMVPTest(unittest.TestCase):
         self.assertTrue((template_dir / "error.html").is_file())
         for template_path in template_dir.glob("*.html"):
             source = template_path.read_text(encoding="utf-8")
-            self.assertIn("location.protocol === 'file:'", source)
-            self.assertIn("http://127.0.0.1:5001/", source)
+            self.assertNotIn("location.protocol === 'file:'", source)
+            self.assertNotIn("http://127.0.0.1:5001/", source)
         self.assertTrue((template_dir / "contract_detail.html").is_file())
         self.assertTrue((template_dir / "quota_detail.html").is_file())
+        self.assertTrue((template_dir / "quota" / "detail.html").is_file())
         response = self.client.get("/")
         self.assertEqual(response.status_code, 200)
         self.assertIn("text/html", response.content_type)

@@ -1,0 +1,23 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>回收站 · Labour OS</title>
+  <link rel="stylesheet" href="{{ url_for('static', filename='style.css') }}">
+  <link rel="stylesheet" href="{{ url_for('static', filename='operator.css') }}">
+</head>
+<body>
+  <main class="app-shell detail-shell">
+    <header class="detail-topbar"><div><a class="back-link" href="{{ url_for('index') }}">← 返回工作台</a><h1>回收站</h1><p>恢复软删除记录；仅管理员可永久删除</p></div></header>
+    <section class="panel detail-panel">
+      <div class="table-wrap"><table><thead><tr><th>资源</th><th>记录编号</th><th>删除时间</th><th>删除人</th><th>操作</th></tr></thead><tbody>
+        {% for item in items %}<tr><td>{{ item.resource }}</td><td class="name">{{ item.entity_id }}</td><td>{{ item.deleted_at }}</td><td>{{ item.deleted_by }}</td><td><span class="inline-actions"><button class="text-button" data-restore-resource="{{ item.resource }}" data-restore-id="{{ item.entity_id }}">恢复</button>{% if can('permanent_delete') %}<button class="text-button danger" data-permanent-resource="{{ item.resource }}" data-permanent-id="{{ item.entity_id }}">永久删除</button>{% endif %}</span></td></tr>
+        {% else %}<tr><td colspan="5" class="empty">回收站为空。</td></tr>{% endfor %}
+      </tbody></table></div>
+    </section>
+  </main>
+  <script src="{{ url_for('static', filename='app.js') }}"></script>
+  <script src="{{ url_for('static', filename='recycle-bin.js') }}"></script>
+</body>
+</html>

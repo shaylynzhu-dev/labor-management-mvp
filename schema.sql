@@ -8,6 +8,9 @@ CREATE TABLE IF NOT EXISTS person (
     introducer TEXT NULL,
     id_last4 TEXT NULL,
     hk_macao_last4 TEXT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
+    deleted_at DATETIME NULL,
+    deleted_by INTEGER NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
 );
 
@@ -26,6 +29,9 @@ CREATE TABLE IF NOT EXISTS quota (
         CHECK(max_replacement_count IN (1, 2)),
     status TEXT NOT NULL DEFAULT 'active'
         CHECK(status IN ('active','in_use','exhausted','invalid')),
+    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
+    deleted_at DATETIME NULL,
+    deleted_by INTEGER NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (user_id) REFERENCES person(id) ON DELETE SET NULL
 );
@@ -48,6 +54,9 @@ CREATE TABLE IF NOT EXISTS contract (
     status TEXT NOT NULL DEFAULT '制作合同'
         CHECK(status IN ('制作合同','交接香港同事','交表香港入境处',
                          '批出入境签证','工人入境','完成合约')),
+    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
+    deleted_at DATETIME NULL,
+    deleted_by INTEGER NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     CHECK (entry_date IS NULL OR date(contract_start_date) = date(entry_date)),
     CHECK (arrival_date IS NULL OR date(arrival_date) = date(entry_date)),
@@ -67,6 +76,9 @@ CREATE TABLE IF NOT EXISTS event (
     description TEXT,
     severity TEXT DEFAULT 'normal',
     event_date DATE NOT NULL DEFAULT CURRENT_DATE,
+    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
+    deleted_at DATETIME NULL,
+    deleted_by INTEGER NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE SET NULL,
     FOREIGN KEY (quota_id) REFERENCES quota(id) ON DELETE SET NULL,
@@ -81,6 +93,9 @@ CREATE TABLE IF NOT EXISTS risk (
     risk_type TEXT,
     status TEXT DEFAULT 'open',
     description TEXT,
+    is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
+    deleted_at DATETIME NULL,
+    deleted_by INTEGER NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE SET NULL,
     FOREIGN KEY (quota_id) REFERENCES quota(id) ON DELETE SET NULL,

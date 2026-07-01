@@ -1,7 +1,6 @@
 <!doctype html>
 <html lang="zh-CN">
 <head>
-  <script>if (location.protocol === 'file:') location.replace('http://127.0.0.1:5001/');</script>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
   <title>{{ contract.contract_id }} · Labour OS</title>
@@ -27,13 +26,13 @@
         <h1>{{ contract.contract_id }}</h1>
         <p>{{ contract.person_name }} · {{ contract.company }}</p>
       </div>
-      <form class="detail-status-form" method="post" action="{{ url_for('update_contract_status', contract_id=contract.contract_id) }}">
+      {% if can('update') %}<form class="detail-status-form" method="post" action="{{ url_for('update_contract_status', contract_id=contract.contract_id) }}">
         <label for="contract-status">当前状态</label>
         <select id="contract-status" name="status">
           {% for status in contract_statuses %}<option {{ 'selected' if status == contract.status }}>{{ status }}</option>{% endfor %}
         </select>
         <button class="button primary">更新状态</button>
-      </form>
+      </form>{% endif %}
     </header>
 
     {% with messages = get_flashed_messages(with_categories=true) %}
@@ -45,7 +44,7 @@
       <article><span>合同开始</span><strong>{{ contract.contract_start_date or '待入境事件' }}</strong></article>
       <article><span>合同结束</span><strong>{{ contract.contract_end_date or '待入境事件' }}</strong></article>
       <article><span>剩余时间</span>{% if contract.remaining_days is not none %}<strong class="days {{ 'overdue' if contract.remaining_days < 0 else 'soon' if contract.remaining_days <= 30 }}">{{ ('已到期 ' ~ (-contract.remaining_days) ~ ' 天') if contract.remaining_days < 0 else (contract.remaining_days ~ ' 天') }}</strong>{% else %}<strong>待入境</strong>{% endif %}</article>
-      <article><span>关联名额</span>{% if quota %}<a class="metric-link" href="{{ url_for('quota_detail', quota_id=quota.id) }}">{{ quota.quota_serial or quota.approval_number or quota.quota_number or ('未编号 #' ~ quota.id) }}</a>{% else %}<strong>未关联</strong>{% endif %}</article>
+      <article><span>关联名额</span>{% if quota %}<a class="metric-link" href="{{ url_for('quota.detail', quota_id=quota.id) }}">{{ quota.quota_serial or quota.approval_number or quota.quota_number or ('未编号 #' ~ quota.id) }}</a>{% else %}<strong>未关联</strong>{% endif %}</article>
       <article><span>合同周期</span><strong>Cycle {{ contract.cycle_index or 1 }}</strong></article>
       <article><span>替补来源</span><strong>{{ contract.parent_contract_id or '首个周期' }}</strong></article>
       <article><span>已被替补</span><strong>{{ '是' if contract.is_replaced else '否' }}</strong></article>

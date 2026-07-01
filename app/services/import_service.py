@@ -3,7 +3,10 @@ import json
 from datetime import date, datetime
 
 from app.utils.excel import validate_excel_shape, validate_excel_upload
-from app.services.dispatch_engine import CONTRACT_LIFECYCLE, normalize_contract_status
+from app.services.dispatch_engine import (
+    CONTRACT_LIFECYCLE, normalize_contract_status, quota_replacement_limit,
+    shift_months,
+)
 
 
 DEFAULT_MAPPINGS = {
@@ -21,6 +24,13 @@ DEFAULT_MAPPINGS = {
         "contract_no": "合同编号", "company_name": "公司名",
         "person_name": "人员", "quota_no": "配额序号",
         "status": "状态",
+    },
+    "lifecycle": {
+        "approval_no": "批文号", "facility": "院舍",
+        "quota_no": "配额编号", "worker_name": "姓名",
+        "contract_no": "合同编号", "visa_no": "签证号", "hkid": "HKID",
+        "entry_date": "入境日期", "contract_end_date": "合同结束日期",
+        "employment_status": "状态", "note": "备注",
     },
 }
 
@@ -76,6 +86,7 @@ class ExcelImportService:
             "person": {"name", "gender"},
             "quota": {"quota_type", "company_name"},
             "contract": {"company_name"},
+            "lifecycle": set(DEFAULT_MAPPINGS["lifecycle"]),
         }[kind]
         required_missing = [
             mapping[key] for key in required_keys if mapping.get(key) not in frame.columns
@@ -92,13 +103,23 @@ class ExcelImportService:
             columns.update({key: value for key, value in mapping.items() if key in columns and value})
         frame = self._frame(kind, uploaded, columns)
         result = {"success": 0, "skipped": 0, "failed": 0, "errors": []}
+        if kind == "lifecycle":
+            result.update(initial=0, replacement=0, renewal=0, resignation=0, replacement_count=0)
         with self.database.transaction() as connection:
             for index, row in frame.iterrows():
                 line = int(index) + 2
                 connection.execute("SAVEPOINT production_import_row")
                 try:
                     outcome = getattr(self, f"_import_{kind}")(connection, row, columns)
-                    result[outcome] += 1
+                    if isinstance(outcome, dict):
+                        result[outcome["outcome"]] += 1
+                        classification = outcome.get("classification")
+                        if classification:
+                            result[classification] += 1
+                            if classification == "replacement":
+                                result["replacement_count"] += 1
+                    else:
+                        result[outcome] += 1
                     connection.execute("RELEASE SAVEPOINT production_import_row")
                 except Exception as error:
                     connection.execute("ROLLBACK TO SAVEPOINT production_import_row")
@@ -188,6 +209,250 @@ class ExcelImportService:
             ),
         )
         return "success"
+
+    def _resolve_lifecycle_quota(self, connection, quota_no, approval_no, facility):
+        if quota_no:
+            rows = connection.execute(
+                """SELECT * FROM quotas WHERE is_deleted=0
+                   AND (quota_number=? OR quota_serial=?)""",
+                (quota_no, quota_no),
+            ).fetchall()
+        elif approval_no and facility:
+            rows = connection.execute(
+                """SELECT * FROM quotas WHERE is_deleted=0
+                   AND approval_number=? AND company_name=?""",
+                (approval_no, facility),
+            ).fetchall()
+        else:
+            raise ValueError("配额编号必填；或同时提供批文号和院舍")
+        if len(rows) != 1:
+            raise ValueError("配额不存在或匹配到多条配额")
+        return rows[0]
+
+    def _resolve_lifecycle_worker(self, connection, name, hkid, visa_no):
+        if not name:
+            raise ValueError("姓名不能为空")
+        rows = []
+        if hkid:
+            rows = connection.execute(
+                "SELECT * FROM people WHERE hkid=? AND is_deleted=0", (hkid,)
+            ).fetchall()
+        if not rows:
+            rows = connection.execute(
+                "SELECT * FROM people WHERE name=? AND is_deleted=0", (name,)
+            ).fetchall()
+        if len(rows) > 1:
+            raise ValueError("人员姓名或HKID匹配到多条记录")
+        if rows:
+            worker_id = rows[0]["id"]
+            connection.execute(
+                """UPDATE people SET visa_number=COALESCE(?,visa_number),
+                          hkid=COALESCE(?,hkid),
+                          id_last4=COALESCE(id_last4,?) WHERE id=?""",
+                (visa_no, hkid, hkid[-4:] if hkid and len(hkid) >= 4 else None, worker_id),
+            )
+            return worker_id, False
+        cursor = connection.execute(
+            """INSERT INTO people(name,gender,id_last4,visa_number,hkid)
+               VALUES (?,NULL,?,?,?)""",
+            (name, hkid[-4:] if hkid and len(hkid) >= 4 else None, visa_no, hkid),
+        )
+        return cursor.lastrowid, True
+
+    def _append_history(
+        self, connection, quota, worker_id, contract_no, start_date, end_date,
+        status, event_type, replacement_round, note,
+    ):
+        connection.execute(
+            """INSERT INTO quota_worker_history
+               (quota_id,worker_id,contract_id,start_date,end_date,status,
+                event_type,replacement_round,source_type,source_note)
+               VALUES (?,?,?,?,?,?,?,?,?,?)""",
+            (
+                quota["id"], worker_id, contract_no, start_date, end_date,
+                status, event_type, replacement_round, quota["quota_type"], note,
+            ),
+        )
+
+    def _import_lifecycle(self, connection, row, columns):
+        approval_no = self._text(self._value(row, columns, "approval_no"))
+        facility = self._text(self._value(row, columns, "facility"))
+        quota_no = self._text(self._value(row, columns, "quota_no"))
+        worker_name = self._text(self._value(row, columns, "worker_name"))
+        contract_no = self._text(self._value(row, columns, "contract_no"))
+        visa_no = self._text(self._value(row, columns, "visa_no"))
+        hkid = self._text(self._value(row, columns, "hkid"))
+        entry_date = self._date(self._value(row, columns, "entry_date"))
+        contract_end = self._date(self._value(row, columns, "contract_end_date"))
+        employment_status = self._text(self._value(row, columns, "employment_status"))
+        note = self._text(self._value(row, columns, "note")) or ""
+        if employment_status not in {"在职", "离职"}:
+            raise ValueError("状态必须为在职或离职")
+        quota = self._resolve_lifecycle_quota(connection, quota_no, approval_no, facility)
+        if quota["status"] in {"invalid", "exhausted"}:
+            raise ValueError("配额已失效或耗尽")
+        worker_id, _created = self._resolve_lifecycle_worker(
+            connection, worker_name, hkid, visa_no
+        )
+
+        history = connection.execute(
+            """SELECT * FROM quota_worker_history
+               WHERE quota_id=? ORDER BY id""",
+            (quota["id"],),
+        ).fetchall()
+        if not history and quota["person_id"]:
+            self._append_history(
+                connection, quota, quota["person_id"], None, quota["start_date"],
+                None, "active", "initial", 0, "由既有配额数据建立初始链",
+            )
+            history = connection.execute(
+                "SELECT * FROM quota_worker_history WHERE quota_id=? ORDER BY id",
+                (quota["id"],),
+            ).fetchall()
+        current = None
+        for item in history:
+            if item["event_type"] in {"initial", "replacement", "renewal"}:
+                current = item
+            elif item["event_type"] == "resignation" and current:
+                if item["worker_id"] == current["worker_id"]:
+                    current = None
+        max_round = max(
+            [int(item["replacement_round"] or 0) for item in history]
+            + [int(quota["replacement_count"] or 0)]
+        )
+
+        if employment_status == "离职":
+            departure_date = contract_end or entry_date
+            if not departure_date:
+                raise ValueError("离职记录必须提供合同结束日期或入境日期作为离职日期")
+            duplicate = connection.execute(
+                """SELECT 1 FROM quota_worker_history
+                   WHERE quota_id=? AND worker_id=? AND event_type='resignation'
+                     AND end_date=? LIMIT 1""",
+                (quota["id"], worker_id, departure_date),
+            ).fetchone()
+            if duplicate:
+                return {"outcome": "skipped"}
+            if not current or current["worker_id"] != worker_id:
+                raise ValueError("该人员不是此配额的当前使用人，无法登记离职")
+            self._append_history(
+                connection, quota, worker_id, current["contract_id"],
+                current["start_date"], departure_date, "closed", "resignation",
+                current["replacement_round"], note,
+            )
+            connection.execute(
+                """UPDATE quota_usages SET end_date=COALESCE(end_date,?)
+                   WHERE quota_id=? AND person_id=? AND end_date IS NULL""",
+                (departure_date, quota["id"], worker_id),
+            )
+            connection.execute(
+                """UPDATE quotas SET person_id=NULL,status='active'
+                   WHERE id=? AND person_id=?""",
+                (quota["id"], worker_id),
+            )
+            return {"outcome": "success", "classification": "resignation"}
+
+        if not entry_date:
+            raise ValueError("在职记录必须提供入境日期")
+        if not contract_no:
+            raise ValueError("在职记录必须提供合同编号")
+        exact = connection.execute(
+            """SELECT 1 FROM quota_worker_history
+               WHERE quota_id=? AND worker_id=? AND contract_id=?
+                 AND start_date=? AND event_type IN ('initial','replacement','renewal')
+               LIMIT 1""",
+            (quota["id"], worker_id, contract_no, entry_date),
+        ).fetchone()
+        if exact:
+            return {"outcome": "skipped"}
+
+        if not history:
+            classification, replacement_round = "initial", 0
+        elif any(
+            item["worker_id"] == worker_id
+            and item["event_type"] in {"initial", "replacement", "renewal"}
+            for item in history
+        ):
+            if "替补" in note:
+                raise ValueError("备注为替补，但配额当前使用人未变化")
+            classification, replacement_round = "renewal", int(current["replacement_round"])
+        else:
+            if "续约" in note:
+                raise ValueError("备注为续约，但配额使用人发生变化")
+            classification, replacement_round = "replacement", max_round + 1
+            maximum = quota_replacement_limit(quota["quota_type"])
+            if replacement_round > maximum:
+                raise ValueError(
+                    f"{quota['quota_type']} 配额替补第{replacement_round}次超过上限{maximum}次"
+                )
+
+        if current:
+            if current["worker_id"] != worker_id:
+                self._append_history(
+                    connection, quota, current["worker_id"], current["contract_id"],
+                    current["start_date"], entry_date, "closed", "resignation",
+                    current["replacement_round"], "导入时根据新使用人自动关闭",
+                )
+            connection.execute(
+                """UPDATE quota_usages SET end_date=COALESCE(end_date,?)
+                   WHERE quota_id=? AND end_date IS NULL""",
+                (entry_date, quota["id"]),
+            )
+
+        existing_contract = connection.execute(
+            "SELECT * FROM contracts WHERE contract_id=? AND is_deleted=0",
+            (contract_no,),
+        ).fetchone()
+        if existing_contract and (
+            existing_contract["person_id"] != worker_id
+            or existing_contract["quota_id"] != quota["id"]
+        ):
+            raise ValueError("合同编号已绑定其他人员或配额")
+        if not contract_end:
+            contract_end = shift_months(
+                datetime.strptime(entry_date, "%Y-%m-%d").date(), 24
+            ).isoformat()
+        if not existing_contract:
+            connection.execute(
+                """INSERT INTO contracts
+                   (contract_id,person_name,company,entry_date,arrival_date,
+                    contract_start_date,contract_end_date,start_date,end_date,
+                    status,person_id,quota_id,cycle_index)
+                   VALUES (?,?,?,?,?,?,?,?,?,'工人入境',?,?,?)""",
+                (
+                    contract_no, worker_name, facility or quota["company_name"],
+                    entry_date, entry_date, entry_date, contract_end, entry_date,
+                    contract_end, worker_id, quota["id"], replacement_round + 1,
+                ),
+            )
+        self._append_history(
+            connection, quota, worker_id, contract_no, entry_date, contract_end,
+            "active", classification, replacement_round, note,
+        )
+        connection.execute(
+            """INSERT INTO quota_usages(quota_id,person_id,start_date)
+               VALUES (?,?,?)""",
+            (quota["id"], worker_id, entry_date),
+        )
+        connection.execute(
+            """UPDATE quotas SET person_id=?,status='in_use',
+                      usage_count=usage_count+1,
+                      replacement_count=MAX(replacement_count,?),
+                      max_replacement_count=? WHERE id=?""",
+            (
+                worker_id, replacement_round,
+                quota_replacement_limit(quota["quota_type"]), quota["id"],
+            ),
+        )
+        connection.execute(
+            """INSERT INTO events(person_id,event_type,note,event_date,created_at)
+               VALUES (?,?,?,?,CURRENT_TIMESTAMP)""",
+            (
+                worker_id, "工人入境",
+                f"Excel自动识别：{classification}；{note}".rstrip("；"), entry_date,
+            ),
+        )
+        return {"outcome": "success", "classification": classification}
 
     @staticmethod
     def template(kind):

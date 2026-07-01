@@ -121,6 +121,15 @@
 .workbench-ui .quick-actions { grid-template-columns: 1.2fr repeat(4, 1fr); box-shadow: none; }
 .workbench-ui .quick-action:hover { background: #f5f8fd; }
 .mobile-nav { display: none; }
+body[data-can-delete="0"] [data-delete-resource],
+body[data-can-update="0"] [data-card-edit],
+body[data-can-update="0"] [data-assign-quota],
+body[data-can-update="0"] form[action*="/status"],
+body[data-can-update="0"] form[action*="workflow-steps"],
+body[data-can-update="0"] form[action*="/complete"],
+body[data-can-update="0"] form[action*="/resolve"],
+body[data-can-create="0"] [data-open],
+body[data-can-create="0"] [data-event-person] { display: none !important; }
 
 @media (max-width: 1180px) {
   .workbench-ui .topbar { grid-template-columns: 1fr auto; padding: 18px 0; height: auto; }

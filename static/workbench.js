@@ -92,4 +92,23 @@
       }
     });
   });
+
+  document.querySelectorAll('[data-delete-resource]').forEach((button) => {
+    button.addEventListener('click', async () => {
+      const label = button.dataset.deleteLabel || '这条记录';
+      if (!window.confirm(`确认删除${label}？删除后将不再出现在业务列表中。`)) return;
+      button.disabled = true;
+      try {
+        await window.labourApi.request(
+          `/api/${encodeURIComponent(button.dataset.deleteResource)}/${encodeURIComponent(button.dataset.deleteId)}`,
+          {method: 'DELETE'},
+        );
+        const row = button.closest('article, tr');
+        if (row) row.remove();
+      } catch (error) {
+        window.alert(error.message || '删除失败，请稍后重试。');
+        button.disabled = false;
+      }
+    });
+  });
 })();

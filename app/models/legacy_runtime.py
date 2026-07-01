@@ -12,7 +12,7 @@ import time
 import uuid
 
 from flask import (
-    Flask, Response, abort, flash, g, jsonify, redirect, render_template, request,
+    Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, session,
     send_from_directory, stream_with_context, url_for,
 )
 from werkzeug.utils import secure_filename
@@ -27,7 +27,9 @@ from app.services.dispatch_engine import (
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
-DATABASE = (BASE_DIR / "labor.db").resolve()
+DATABASE = Path(
+    os.environ.get("LABOUR_OS_DATABASE_PATH", BASE_DIR / "labor.db")
+).expanduser().resolve()
 SCHEMA_FILE = BASE_DIR / "schema.sql"
 UPLOAD_DIR = BASE_DIR / "uploads"
 UPLOAD_DIR.mkdir(exist_ok=True)
@@ -128,10 +130,10 @@ def db_insert(table, values):
 def db_query(table, filters=None, order_by="id", limit=None):
     table_sql = _standard_table(table)
     filters = filters or {}
-    sql = f"SELECT * FROM {table_sql}"
+    sql = f"SELECT * FROM {table_sql} WHERE is_deleted=0"
     parameters = []
     if filters:
-        sql += " WHERE " + " AND ".join(
+        sql += " AND " + " AND ".join(
             f"{_quoted_identifier(column)} = ?" for column in filters
         )
         parameters.extend(filters.values())
@@ -173,7 +175,7 @@ def db_update(table, values, filters):
             if target == "工人入境":
                 raise ValueError("Worker entry must come from an entry event")
     set_sql = ", ".join(f"{_quoted_identifier(column)} = ?" for column in values)
-    where_sql = " AND ".join(
+    where_sql = "is_deleted=0 AND " + " AND ".join(
         f"{_quoted_identifier(column)} = ?" for column in filters
     )
     cursor = db.execute(
@@ -207,7 +209,8 @@ def refresh_standard_risks(db=None):
            SELECT user_id, id, 'quota_expired', 'open',
                   'Quota expired on ' || end_date
            FROM quota
-           WHERE end_date IS NOT NULL AND date(end_date) < date('now', 'localtime')"""
+           WHERE is_deleted=0 AND end_date IS NOT NULL
+             AND date(end_date) < date('now', 'localtime')"""
     )
 
 
@@ -749,6 +752,60 @@ def close_db(_error=None):
         db.close()
 
 
+SOFT_DELETE_TABLES = (
+    "people", "quotas", "contracts", "events", "renewals",
+    "workflow_instances", "documents", "lifecycle_nodes", "risks", "tasks",
+    "person", "quota", "contract", "event", "risk",
+)
+
+SOFT_DELETE_RESOURCES = {
+    "people": ("people", "id", "person", "id"),
+    "quotas": ("quotas", "id", "quota", "id"),
+    "contracts": ("contracts", "contract_id", "contract", "contract_no"),
+    "events": ("events", "id", "event", "id"),
+    "renewals": ("renewals", "id", None, None),
+    "workflows": ("workflow_instances", "id", None, None),
+    "documents": ("documents", "id", None, None),
+    "lifecycle": ("lifecycle_nodes", "id", None, None),
+    "risks": ("risks", "id", "risk", "id"),
+    "tasks": ("tasks", "id", None, None),
+}
+SOFT_DELETE_ALIASES = {
+    "person": "people", "persons": "people",
+    "quota": "quotas", "contract": "contracts",
+    "event": "events", "renewal": "renewals", "workflow": "workflows",
+    "document": "documents", "risk": "risks", "task": "tasks",
+    "workflow_instances": "workflows", "lifecycle-node": "lifecycle",
+    "lifecycle_nodes": "lifecycle",
+}
+
+
+def ensure_soft_delete_schema(db):
+    existing_tables = {
+        row["name"]
+        for row in db.execute(
+            "SELECT name FROM sqlite_master WHERE type='table'"
+        ).fetchall()
+    }
+    for table in SOFT_DELETE_TABLES:
+        if table not in existing_tables:
+            continue
+        columns = {
+            row["name"] for row in db.execute(f"PRAGMA table_info({table})").fetchall()
+        }
+        if "is_deleted" not in columns:
+            db.execute(
+                f"ALTER TABLE {table} ADD COLUMN is_deleted INTEGER NOT NULL DEFAULT 0"
+            )
+        if "deleted_at" not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN deleted_at DATETIME NULL")
+        if "deleted_by" not in columns:
+            db.execute(f"ALTER TABLE {table} ADD COLUMN deleted_by INTEGER NULL")
+        db.execute(
+            f"CREATE INDEX IF NOT EXISTS idx_{table}_soft_delete ON {table}(is_deleted)"
+        )
+
+
 def init_db():
     db = get_db()
     db.executescript(
@@ -949,6 +1006,25 @@ def init_db():
             FOREIGN KEY (workflow_id) REFERENCES workflow_instances(id) ON DELETE SET NULL
         );
 
+        CREATE TABLE IF NOT EXISTS quota_worker_history (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            quota_id INTEGER NOT NULL,
+            worker_id INTEGER NOT NULL,
+            contract_id TEXT,
+            start_date TEXT,
+            end_date TEXT,
+            status TEXT NOT NULL CHECK(status IN ('active','closed')),
+            event_type TEXT NOT NULL
+                CHECK(event_type IN ('initial','replacement','renewal','resignation')),
+            replacement_round INTEGER NOT NULL DEFAULT 0 CHECK(replacement_round >= 0),
+            source_type TEXT NOT NULL CHECK(source_type IN ('SWD','LD')),
+            source_note TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            FOREIGN KEY (quota_id) REFERENCES quotas(id) ON DELETE RESTRICT,
+            FOREIGN KEY (worker_id) REFERENCES people(id) ON DELETE RESTRICT,
+            FOREIGN KEY (contract_id) REFERENCES contracts(contract_id) ON DELETE SET NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_people_name ON people(name);
         CREATE INDEX IF NOT EXISTS idx_quotas_number ON quotas(quota_number);
         CREATE INDEX IF NOT EXISTS idx_events_person ON events(person_id);
@@ -965,6 +1041,10 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_lifecycle_due ON lifecycle_nodes(due_date, status);
         CREATE INDEX IF NOT EXISTS idx_risks_level ON risks(risk_level, status);
         CREATE INDEX IF NOT EXISTS idx_tasks_due ON tasks(due_date, status);
+        CREATE INDEX IF NOT EXISTS idx_quota_worker_history_chain
+            ON quota_worker_history(quota_id,replacement_round,id);
+        CREATE INDEX IF NOT EXISTS idx_quota_worker_history_worker
+            ON quota_worker_history(worker_id,created_at);
         """
     )
 
@@ -973,6 +1053,9 @@ def init_db():
     person_columns = {
         row["name"]: row for row in db.execute("PRAGMA table_info(people)").fetchall()
     }
+    for name in ("visa_number", "hkid"):
+        if name not in person_columns:
+            db.execute(f"ALTER TABLE people ADD COLUMN {name} TEXT")
     person_needs_rebuild = (
         not {"gender", "company_name", "introducer"}.issubset(person_columns)
         or person_columns.get("id_last4", {"notnull": 0})["notnull"]
@@ -1019,6 +1102,13 @@ def init_db():
             raise
         finally:
             db.execute("PRAGMA foreign_keys = ON")
+
+    current_person_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(people)").fetchall()
+    }
+    for name in ("visa_number", "hkid"):
+        if name not in current_person_columns:
+            db.execute(f"ALTER TABLE people ADD COLUMN {name} TEXT")
 
     # Non-destructive Quota migration. Legacy quota_number values remain intact,
     # while new records may stay intentionally incomplete until details arrive.
@@ -1153,6 +1243,7 @@ def init_db():
             db.execute("PRAGMA foreign_keys = ON")
     ensure_legacy_dispatch_schema(db)
     initialize_standard_schema(db)
+    ensure_soft_delete_schema(db)
     db.commit()
 
 
@@ -1195,7 +1286,7 @@ def apply_arrival_event(db, person_id, event_date):
     contract_start, contract_end = calculate_contract_period(arrival)
     contract = db.execute(
         """SELECT contract_id FROM contracts
-           WHERE person_id=? AND status!='完成合约'
+           WHERE person_id=? AND is_deleted=0 AND status!='完成合约'
            ORDER BY cycle_index DESC, created_at DESC, contract_id DESC LIMIT 1""",
         (person_id,),
     ).fetchone()
@@ -1219,7 +1310,7 @@ def apply_arrival_event(db, person_id, event_date):
     # Standard-table compatibility for direct helper/API users.
     standard_contract = db.execute(
         """SELECT id,contract_no,quota_id,entry_date FROM contract
-           WHERE person_id=? AND status!='完成合约'
+           WHERE person_id=? AND is_deleted=0 AND status!='完成合约'
            ORDER BY cycle_index DESC,created_at DESC,id DESC LIMIT 1""",
         (person_id,),
     ).fetchone()
@@ -1289,7 +1380,7 @@ def refresh_renewal_statuses(db):
     changed = False
     rows = db.execute(
         """SELECT id, current_contract_end_date, passport_expiry_check,
-                  id_card_expiry_check, status FROM renewals"""
+                  id_card_expiry_check, status FROM renewals WHERE is_deleted=0"""
     ).fetchall()
     for row in rows:
         contract_end = datetime.strptime(row["current_contract_end_date"], "%Y-%m-%d").date()
@@ -1347,11 +1438,11 @@ def upsert_lifecycle_node(db, person_id, quota_id, workflow_id, node_type, due_d
 
 
 def generate_lifecycle_nodes(db):
-    renewals = db.execute("SELECT * FROM renewals").fetchall()
+    renewals = db.execute("SELECT * FROM renewals WHERE is_deleted=0").fetchall()
     for renewal in renewals:
         workflow = db.execute(
             """SELECT id FROM workflow_instances
-               WHERE person_id=? AND quota_id=? ORDER BY id DESC LIMIT 1""",
+               WHERE person_id=? AND quota_id=? AND is_deleted=0 ORDER BY id DESC LIMIT 1""",
             (renewal["person_id"], renewal["quota_id"]),
         ).fetchone()
         workflow_id = workflow["id"] if workflow else None
@@ -1371,12 +1462,12 @@ def generate_lifecycle_nodes(db):
     today = date.today().isoformat()
     db.execute(
         """UPDATE lifecycle_nodes SET status='逾期'
-           WHERE status='待处理' AND date(due_date) < date(?)""",
+           WHERE is_deleted=0 AND status='待处理' AND date(due_date) < date(?)""",
         (today,),
     )
     db.execute(
         """UPDATE tasks SET status='逾期', updated_at=CURRENT_TIMESTAMP
-           WHERE status IN ('待办','进行中') AND date(due_date) < date(?)""",
+           WHERE is_deleted=0 AND status IN ('待办','进行中') AND date(due_date) < date(?)""",
         (today,),
     )
     db.commit()
@@ -1403,7 +1494,7 @@ def refresh_risks(db, quota_views):
         )
 
     today = date.today()
-    for contract in db.execute("SELECT * FROM contracts").fetchall():
+    for contract in db.execute("SELECT * FROM contracts WHERE is_deleted=0").fetchall():
         if not contract["end_date"]:
             continue
         end = datetime.strptime(contract["end_date"], "%Y-%m-%d").date()
@@ -1420,7 +1511,7 @@ def refresh_risks(db, quota_views):
                 f"合同将在 {remaining} 天内到期",
                 f"AUTO:contract:{contract['contract_id']}",
             )
-    for renewal in db.execute("SELECT * FROM renewals").fetchall():
+    for renewal in db.execute("SELECT * FROM renewals WHERE is_deleted=0").fetchall():
         if renewal["status"] in {"不可续", "风险"}:
             level = "高" if renewal["status"] == "不可续" else "中"
             record_risk(
@@ -1440,7 +1531,9 @@ def refresh_risks(db, quota_views):
                 None, quota["id"], None, "名额", level,
                 f"名额仅剩 {quota['remaining_months']} 个月", f"AUTO:quota:{quota['id']}",
             )
-    for document in db.execute("SELECT id, person_id, quota_id, ocr_status FROM documents").fetchall():
+    for document in db.execute(
+        "SELECT id, person_id, quota_id, ocr_status FROM documents WHERE is_deleted=0"
+    ).fetchall():
         if document["ocr_status"] == "待OCR":
             record_risk(
                 document["person_id"], document["quota_id"], None, "资料", "中",
@@ -1449,22 +1542,29 @@ def refresh_risks(db, quota_views):
     if active_keys:
         placeholders = ",".join("?" for _ in active_keys)
         db.execute(
-            f"DELETE FROM risks WHERE source_key LIKE 'AUTO:%' AND source_key NOT IN ({placeholders})",
+            f"""UPDATE risks SET is_deleted=1,deleted_at=CURRENT_TIMESTAMP
+                WHERE is_deleted=0 AND source_key LIKE 'AUTO:%'
+                  AND source_key NOT IN ({placeholders})""",
             active_keys,
         )
     else:
-        db.execute("DELETE FROM risks WHERE source_key LIKE 'AUTO:%'")
+        db.execute(
+            """UPDATE risks SET is_deleted=1,deleted_at=CURRENT_TIMESTAMP
+               WHERE is_deleted=0 AND source_key LIKE 'AUTO:%'"""
+        )
     db.commit()
 
 
 def create_entry_tasks(db, person_id, event_day=None, workflow_id=None, quota_id=None):
     event_day = event_day or date.today()
     if quota_id is None:
-        quota = db.execute("SELECT id FROM quotas WHERE person_id=?", (person_id,)).fetchone()
+        quota = db.execute(
+            "SELECT id FROM quotas WHERE person_id=? AND is_deleted=0", (person_id,)
+        ).fetchone()
         quota_id = quota["id"] if quota else None
     if workflow_id is None:
         workflow = db.execute(
-            "SELECT id FROM workflow_instances WHERE person_id=? ORDER BY id DESC LIMIT 1",
+            "SELECT id FROM workflow_instances WHERE person_id=? AND is_deleted=0 ORDER BY id DESC LIMIT 1",
             (person_id,),
         ).fetchone()
         workflow_id = workflow["id"] if workflow else None
@@ -1484,7 +1584,7 @@ def create_entry_tasks(db, person_id, event_day=None, workflow_id=None, quota_id
 
 def create_workflow_record(db, person_id, quota_id, workflow_name):
     contract = db.execute(
-        """SELECT status FROM contracts WHERE person_id=? AND quota_id=?
+        """SELECT status FROM contracts WHERE person_id=? AND quota_id=? AND is_deleted=0
            ORDER BY cycle_index DESC,created_at DESC LIMIT 1""",
         (person_id, quota_id),
     ).fetchone()
@@ -1526,9 +1626,9 @@ def collect_push_reminders():
             """SELECT r.id, r.risk_level, r.risk_type, r.reason, r.contract_id,
                       p.name AS person_name, q.quota_number
                FROM risks r
-               LEFT JOIN people p ON p.id=r.person_id
-               LEFT JOIN quotas q ON q.id=r.quota_id
-               WHERE r.status='开放' AND r.risk_level IN ('高','中')
+               LEFT JOIN people p ON p.id=r.person_id AND p.is_deleted=0
+               LEFT JOIN quotas q ON q.id=r.quota_id AND q.is_deleted=0
+               WHERE r.is_deleted=0 AND r.status='开放' AND r.risk_level IN ('高','中')
                ORDER BY CASE r.risk_level WHEN '高' THEN 0 ELSE 1 END, r.id DESC LIMIT 8"""
         ).fetchall():
             reminders.append({
@@ -1542,8 +1642,9 @@ def collect_push_reminders():
         for row in connection.execute(
             """SELECT t.id, t.title, t.due_date, t.status, p.name AS person_name,
                       CAST(julianday(t.due_date)-julianday(date('now','localtime')) AS INTEGER) AS days
-               FROM tasks t JOIN people p ON p.id=t.person_id
-               WHERE t.status!='已完成' AND date(t.due_date)<=date('now','localtime','+7 days')
+               FROM tasks t JOIN people p ON p.id=t.person_id AND p.is_deleted=0
+               WHERE t.is_deleted=0 AND t.status!='已完成'
+                 AND date(t.due_date)<=date('now','localtime','+7 days')
                ORDER BY t.due_date LIMIT 8"""
         ).fetchall():
             reminders.append({
@@ -1557,7 +1658,7 @@ def collect_push_reminders():
         for row in connection.execute(
             """SELECT contract_id, person_name, end_date,
                       CAST(julianday(end_date)-julianday(date('now','localtime')) AS INTEGER) AS days
-               FROM contracts WHERE status!='完成合约'
+               FROM contracts WHERE is_deleted=0 AND status!='完成合约'
                  AND date(end_date) BETWEEN date('now','localtime') AND date('now','localtime','+30 days')
                ORDER BY end_date LIMIT 8"""
         ).fetchall():
@@ -1580,7 +1681,8 @@ def build_quota_views(db, quotas):
     usages = db.execute(
         """
         SELECT u.*, p.name AS person_name
-        FROM quota_usages u JOIN people p ON p.id = u.person_id
+        FROM quota_usages u JOIN people p ON p.id = u.person_id AND p.is_deleted=0
+        JOIN quotas q ON q.id=u.quota_id AND q.is_deleted=0
         ORDER BY u.quota_id, u.start_date, u.id
         """
     ).fetchall()
@@ -1630,8 +1732,8 @@ def find_question_subject(db, question):
             SELECT c.contract_id, c.person_name, c.company, c.start_date,
                    c.end_date, c.status, c.person_id,
                    p.id_last4, p.permit_last4
-            FROM contracts c LEFT JOIN people p ON p.id = c.person_id
-            WHERE c.contract_id = ?
+            FROM contracts c LEFT JOIN people p ON p.id = c.person_id AND p.is_deleted=0
+            WHERE c.contract_id = ? AND c.is_deleted=0
             """,
             (candidate,),
         ).fetchone()
@@ -1639,7 +1741,7 @@ def find_question_subject(db, question):
             return row, "contract"
 
     contract_people = db.execute(
-        "SELECT DISTINCT person_name FROM contracts ORDER BY length(person_name) DESC"
+        "SELECT DISTINCT person_name FROM contracts WHERE is_deleted=0 ORDER BY length(person_name) DESC"
     ).fetchall()
     matched_name = next(
         (row["person_name"] for row in contract_people if row["person_name"] in question), None
@@ -1650,8 +1752,8 @@ def find_question_subject(db, question):
             SELECT c.contract_id, c.person_name, c.company, c.start_date,
                    c.end_date, c.status, c.person_id,
                    p.id_last4, p.permit_last4
-            FROM contracts c LEFT JOIN people p ON p.id = c.person_id
-            WHERE c.person_name = ?
+            FROM contracts c LEFT JOIN people p ON p.id = c.person_id AND p.is_deleted=0
+            WHERE c.person_name = ? AND c.is_deleted=0
             ORDER BY c.end_date DESC, c.created_at DESC LIMIT 1
             """,
             (matched_name,),
@@ -1665,8 +1767,8 @@ def find_question_subject(db, question):
             SELECT c.contract_id, c.person_name, c.company, c.start_date,
                    c.end_date, c.status, c.person_id,
                    p.id_last4, p.permit_last4
-            FROM people p JOIN contracts c ON c.person_id = p.id
-            WHERE p.id_last4 = ? OR p.permit_last4 = ?
+            FROM people p JOIN contracts c ON c.person_id = p.id AND c.is_deleted=0
+            WHERE p.is_deleted=0 AND (p.id_last4 = ? OR p.permit_last4 = ?)
             ORDER BY c.end_date DESC, c.created_at DESC LIMIT 1
             """,
             (suffix, suffix),
@@ -1675,7 +1777,7 @@ def find_question_subject(db, question):
             return row, "certificate"
 
     # Backward-compatible lookup for people who do not yet have a contract.
-    people = db.execute("SELECT name FROM people ORDER BY length(name) DESC").fetchall()
+    people = db.execute("SELECT name FROM people WHERE is_deleted=0 ORDER BY length(name) DESC").fetchall()
     matched_name = next((row["name"] for row in people if row["name"] in question), None)
     if matched_name:
         row = db.execute(
@@ -1683,7 +1785,7 @@ def find_question_subject(db, question):
             SELECT NULL AS contract_id, p.name AS person_name, NULL AS company,
                    NULL AS start_date, NULL AS end_date, NULL AS status,
                    p.id AS person_id, p.id_last4, p.permit_last4
-            FROM people p WHERE p.name = ? ORDER BY p.id DESC LIMIT 1
+            FROM people p WHERE p.name = ? AND p.is_deleted=0 ORDER BY p.id DESC LIMIT 1
             """,
             (matched_name,),
         ).fetchone()
@@ -1695,7 +1797,7 @@ def find_question_subject(db, question):
                    NULL AS start_date, NULL AS end_date, NULL AS status,
                    p.id AS person_id, p.id_last4, p.permit_last4
             FROM people p
-            WHERE p.id_last4 = ? OR p.permit_last4 = ?
+            WHERE p.is_deleted=0 AND (p.id_last4 = ? OR p.permit_last4 = ?)
             ORDER BY p.id DESC LIMIT 1
             """,
             (suffix, suffix),
@@ -1739,7 +1841,7 @@ def answer_question(db, question):
         events = db.execute(
             """
             SELECT event_type, note, created_at FROM events
-            WHERE person_id = ? ORDER BY created_at DESC, id DESC LIMIT 3
+            WHERE person_id = ? AND is_deleted=0 ORDER BY created_at DESC, id DESC LIMIT 3
             """,
             (subject["person_id"],),
         ).fetchall()
@@ -1796,6 +1898,23 @@ def index(default_view="overview"):
     keyword = request.args.get("q", "").strip()
     document_keyword = request.args.get("doc_q", "").strip()
     selected_status = request.args.get("status", "").strip()
+    import_result = None
+    import_log_id = request.args.get("import_log", "").strip()
+    if import_log_id.isdigit():
+        import_log = db.execute(
+            """SELECT * FROM import_logs WHERE id=?
+               AND (?='admin' OR user_id=?)""",
+            (int(import_log_id), session.get("role"), session.get("user_id")),
+        ).fetchone()
+        if import_log:
+            try:
+                import_result = json.loads(import_log["result_json"] or "{}")
+            except (TypeError, json.JSONDecodeError):
+                import_result = {"errors": json.loads(import_log["errors_json"] or "[]")}
+            import_result.update(
+                filename=import_log["filename"], import_type=import_log["import_type"],
+                created_at=import_log["created_at"], log_id=import_log["id"],
+            )
     if selected_status not in CONTRACT_STATUSES:
         selected_status = ""
     like = f"%{keyword}%"
@@ -1804,8 +1923,9 @@ def index(default_view="overview"):
         """
         SELECT c.*, p.id_last4, p.permit_last4,
                CAST(julianday(c.end_date) - julianday(date('now', 'localtime')) AS INTEGER) AS remaining_days
-        FROM contracts c LEFT JOIN people p ON p.id = c.person_id
-        WHERE (? = '' OR c.contract_id LIKE ? OR c.person_name LIKE ? OR c.company LIKE ?)
+        FROM contracts c LEFT JOIN people p ON p.id = c.person_id AND p.is_deleted=0
+        WHERE c.is_deleted=0
+          AND (? = '' OR c.contract_id LIKE ? OR c.person_name LIKE ? OR c.company LIKE ?)
           AND (? = '' OR c.status = ?)
         ORDER BY CASE WHEN c.status = '完成合约' THEN 1 ELSE 0 END,
                  c.end_date ASC, c.created_at DESC
@@ -1816,14 +1936,14 @@ def index(default_view="overview"):
     people = db.execute(
         """
         SELECT p.*, q.quota_number,
-               (SELECT event_type FROM events e WHERE e.person_id = p.id
+               (SELECT event_type FROM events e WHERE e.person_id = p.id AND e.is_deleted=0
                 ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS latest_status,
-               (SELECT created_at FROM events e WHERE e.person_id = p.id
+               (SELECT created_at FROM events e WHERE e.person_id = p.id AND e.is_deleted=0
                 ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS latest_event_at
         FROM people p
-        LEFT JOIN quotas q ON q.person_id = p.id
-        WHERE ? = '' OR p.name LIKE ? OR p.id_last4 LIKE ?
-          OR p.permit_last4 LIKE ? OR COALESCE(q.quota_number, '') LIKE ?
+        LEFT JOIN quotas q ON q.person_id = p.id AND q.is_deleted=0
+        WHERE p.is_deleted=0 AND (? = '' OR p.name LIKE ? OR p.id_last4 LIKE ?
+          OR p.permit_last4 LIKE ? OR COALESCE(q.quota_number, '') LIKE ?)
         ORDER BY p.id DESC
         """,
         (keyword, like, like, like, like),
@@ -1832,11 +1952,11 @@ def index(default_view="overview"):
     quota_rows = db.execute(
         """
         SELECT q.*, p.name AS person_name
-        FROM quotas q LEFT JOIN people p ON p.id = q.person_id
-        WHERE ? = '' OR COALESCE(q.quota_number, '') LIKE ?
+        FROM quotas q LEFT JOIN people p ON p.id = q.person_id AND p.is_deleted=0
+        WHERE q.is_deleted=0 AND (? = '' OR COALESCE(q.quota_number, '') LIKE ?
           OR COALESCE(q.approval_number, '') LIKE ?
           OR COALESCE(q.quota_serial, '') LIKE ? OR q.company_name LIKE ?
-          OR COALESCE(p.name, '') LIKE ?
+          OR COALESCE(p.name, '') LIKE ?)
         ORDER BY q.id DESC
         """,
         (keyword, like, like, like, like, like),
@@ -1844,7 +1964,8 @@ def index(default_view="overview"):
     quotas = build_quota_views(db, quota_rows)
     all_quota_rows = db.execute(
         """SELECT q.*, p.name AS person_name
-           FROM quotas q LEFT JOIN people p ON p.id=q.person_id ORDER BY q.id DESC"""
+           FROM quotas q LEFT JOIN people p ON p.id=q.person_id AND p.is_deleted=0
+           WHERE q.is_deleted=0 ORDER BY q.id DESC"""
     ).fetchall()
     all_quota_views = build_quota_views(db, all_quota_rows)
     generate_lifecycle_nodes(db)
@@ -1853,8 +1974,9 @@ def index(default_view="overview"):
     events = db.execute(
         """
         SELECT e.*, p.name AS person_name
-        FROM events e JOIN people p ON p.id = e.person_id
-        WHERE ? = '' OR p.name LIKE ? OR e.event_type LIKE ? OR e.note LIKE ?
+        FROM events e JOIN people p ON p.id = e.person_id AND p.is_deleted=0
+        WHERE e.is_deleted=0
+          AND (? = '' OR p.name LIKE ? OR e.event_type LIKE ? OR e.note LIKE ?)
         ORDER BY e.created_at DESC, e.id DESC LIMIT 20
         """,
         (keyword, like, like, like),
@@ -1864,8 +1986,9 @@ def index(default_view="overview"):
         """
         SELECT r.*, p.name AS person_name, q.quota_number, q.quota_type
         FROM renewals r
-        JOIN people p ON p.id = r.person_id
-        JOIN quotas q ON q.id = r.quota_id
+        JOIN people p ON p.id = r.person_id AND p.is_deleted=0
+        JOIN quotas q ON q.id = r.quota_id AND q.is_deleted=0
+        WHERE r.is_deleted=0
         ORDER BY CASE r.status WHEN '风险' THEN 0 WHEN '不可续' THEN 1 ELSE 2 END,
                  r.submission_deadline ASC
         """
@@ -1876,10 +1999,11 @@ def index(default_view="overview"):
         """
         SELECT d.*, p.name AS person_name, q.quota_number, w.workflow_code
         FROM documents d
-        JOIN people p ON p.id=d.person_id
-        JOIN quotas q ON q.id=d.quota_id
-        JOIN workflow_instances w ON w.id=d.workflow_id
-        WHERE ?='' OR d.title LIKE ? OR d.filename LIKE ? OR d.ocr_text LIKE ?
+        JOIN people p ON p.id=d.person_id AND p.is_deleted=0
+        JOIN quotas q ON q.id=d.quota_id AND q.is_deleted=0
+        JOIN workflow_instances w ON w.id=d.workflow_id AND w.is_deleted=0
+        WHERE d.is_deleted=0
+          AND (?='' OR d.title LIKE ? OR d.filename LIKE ? OR d.ocr_text LIKE ?)
         ORDER BY d.id DESC
         """,
         (document_keyword, doc_like, doc_like, doc_like),
@@ -1890,8 +2014,9 @@ def index(default_view="overview"):
                (SELECT id FROM workflow_steps s WHERE s.workflow_id=w.id
                 AND s.status='待处理' ORDER BY s.step_order LIMIT 1) AS active_step_id
         FROM workflow_instances w
-        JOIN people p ON p.id=w.person_id
-        JOIN quotas q ON q.id=w.quota_id
+        JOIN people p ON p.id=w.person_id AND p.is_deleted=0
+        JOIN quotas q ON q.id=w.quota_id AND q.is_deleted=0
+        WHERE w.is_deleted=0
         ORDER BY CASE w.status WHEN '进行中' THEN 0 ELSE 1 END, w.id DESC
         """
     ).fetchall()
@@ -1900,9 +2025,10 @@ def index(default_view="overview"):
         SELECT n.*, p.name AS person_name, q.quota_number,
                w.workflow_code
         FROM lifecycle_nodes n
-        JOIN people p ON p.id=n.person_id
-        JOIN quotas q ON q.id=n.quota_id
-        LEFT JOIN workflow_instances w ON w.id=n.workflow_id
+        JOIN people p ON p.id=n.person_id AND p.is_deleted=0
+        JOIN quotas q ON q.id=n.quota_id AND q.is_deleted=0
+        LEFT JOIN workflow_instances w ON w.id=n.workflow_id AND w.is_deleted=0
+        WHERE n.is_deleted=0
         ORDER BY CASE n.status WHEN '逾期' THEN 0 WHEN '待处理' THEN 1 ELSE 2 END,
                  n.due_date
         """
@@ -1911,8 +2037,9 @@ def index(default_view="overview"):
         """
         SELECT r.*, p.name AS person_name, q.quota_number
         FROM risks r
-        LEFT JOIN people p ON p.id=r.person_id
-        LEFT JOIN quotas q ON q.id=r.quota_id
+        LEFT JOIN people p ON p.id=r.person_id AND p.is_deleted=0
+        LEFT JOIN quotas q ON q.id=r.quota_id AND q.is_deleted=0
+        WHERE r.is_deleted=0
         ORDER BY CASE r.risk_level WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END,
                  r.id DESC
         """
@@ -1921,39 +2048,40 @@ def index(default_view="overview"):
         """
         SELECT t.*, p.name AS person_name, q.quota_number, w.workflow_code
         FROM tasks t
-        JOIN people p ON p.id=t.person_id
-        LEFT JOIN quotas q ON q.id=t.quota_id
-        LEFT JOIN workflow_instances w ON w.id=t.workflow_id
+        JOIN people p ON p.id=t.person_id AND p.is_deleted=0
+        LEFT JOIN quotas q ON q.id=t.quota_id AND q.is_deleted=0
+        LEFT JOIN workflow_instances w ON w.id=t.workflow_id AND w.is_deleted=0
+        WHERE t.is_deleted=0
         ORDER BY CASE t.status WHEN '逾期' THEN 0 WHEN '待办' THEN 1
                               WHEN '进行中' THEN 2 ELSE 3 END, t.due_date
         """
     ).fetchall()
 
     counts = {
-        "documents": db.execute("SELECT COUNT(*) FROM documents").fetchone()[0],
+        "documents": db.execute("SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0],
         "active_workflows": db.execute(
-            "SELECT COUNT(*) FROM workflow_instances WHERE status='进行中'"
+            "SELECT COUNT(*) FROM workflow_instances WHERE is_deleted=0 AND status='进行中'"
         ).fetchone()[0],
-        "open_risks": db.execute("SELECT COUNT(*) FROM risks WHERE status='开放'").fetchone()[0],
+        "open_risks": db.execute("SELECT COUNT(*) FROM risks WHERE is_deleted=0 AND status='开放'").fetchone()[0],
         "open_tasks": db.execute(
-            "SELECT COUNT(*) FROM tasks WHERE status!='已完成'"
+            "SELECT COUNT(*) FROM tasks WHERE is_deleted=0 AND status!='已完成'"
         ).fetchone()[0],
-        "contracts": db.execute("SELECT COUNT(*) FROM contracts").fetchone()[0],
+        "contracts": db.execute("SELECT COUNT(*) FROM contracts WHERE is_deleted=0").fetchone()[0],
         "active_contracts": db.execute(
-            "SELECT COUNT(*) FROM contracts WHERE status != '完成合约'"
+            "SELECT COUNT(*) FROM contracts WHERE is_deleted=0 AND status != '完成合约'"
         ).fetchone()[0],
         "expiring_contracts": db.execute(
             """SELECT COUNT(*) FROM contracts
-               WHERE status != '完成合约'
+               WHERE is_deleted=0 AND status != '完成合约'
                  AND date(end_date) BETWEEN date('now', 'localtime')
                  AND date('now', 'localtime', '+30 days')"""
         ).fetchone()[0],
         "completed_contracts": db.execute(
-            "SELECT COUNT(*) FROM contracts WHERE status = '完成合约'"
+            "SELECT COUNT(*) FROM contracts WHERE is_deleted=0 AND status = '完成合约'"
         ).fetchone()[0],
-        "people": db.execute("SELECT COUNT(*) FROM people").fetchone()[0],
-        "quotas": db.execute("SELECT COUNT(*) FROM quotas").fetchone()[0],
-        "occupied": db.execute("SELECT COUNT(*) FROM quotas WHERE person_id IS NOT NULL").fetchone()[0],
+        "people": db.execute("SELECT COUNT(*) FROM people WHERE is_deleted=0").fetchone()[0],
+        "quotas": db.execute("SELECT COUNT(*) FROM quotas WHERE is_deleted=0").fetchone()[0],
+        "occupied": db.execute("SELECT COUNT(*) FROM quotas WHERE is_deleted=0 AND person_id IS NOT NULL").fetchone()[0],
     }
     counts["available"] = counts["quotas"] - counts["occupied"]
     risk_counts = {
@@ -1971,7 +2099,7 @@ def index(default_view="overview"):
                   CAST(julianday(c.end_date)-julianday(date('now','localtime')) AS INTEGER)
                     AS remaining_days
            FROM contracts c
-           WHERE c.status!='完成合约'
+           WHERE c.is_deleted=0 AND c.status!='完成合约'
              AND date(c.end_date) BETWEEN date('now','localtime')
                                       AND date('now','localtime','+90 days')
            ORDER BY c.end_date LIMIT 12"""
@@ -2008,10 +2136,11 @@ def index(default_view="overview"):
 
     latest_entries = db.execute(
         """SELECT e.*, p.name AS person_name
-           FROM events e JOIN people p ON p.id=e.person_id
-           WHERE e.event_type IN ('入境','工人入境')
+           FROM events e JOIN people p ON p.id=e.person_id AND p.is_deleted=0
+           WHERE e.is_deleted=0 AND e.event_type IN ('入境','工人入境')
              AND e.id=(SELECT e2.id FROM events e2
-                       WHERE e2.person_id=e.person_id AND e2.event_type IN ('入境','工人入境')
+                       WHERE e2.person_id=e.person_id AND e2.is_deleted=0
+                         AND e2.event_type IN ('入境','工人入境')
                        ORDER BY e2.event_date DESC, e2.id DESC LIMIT 1)
            ORDER BY e.event_date DESC, e.id DESC LIMIT 20"""
     ).fetchall()
@@ -2142,8 +2271,8 @@ def index(default_view="overview"):
         matched_person = db.execute(
             """SELECT p.*, q.id AS quota_id, q.quota_number, q.quota_type,
                       q.company_name AS quota_company
-               FROM people p LEFT JOIN quotas q ON q.person_id=p.id
-               WHERE p.name LIKE ?
+               FROM people p LEFT JOIN quotas q ON q.person_id=p.id AND q.is_deleted=0
+               WHERE p.is_deleted=0 AND p.name LIKE ?
                ORDER BY CASE WHEN p.name=? THEN 0 ELSE 1 END, p.id DESC LIMIT 1""",
             (like, keyword),
         ).fetchone()
@@ -2153,14 +2282,14 @@ def index(default_view="overview"):
                           CAST(julianday(c.end_date)-julianday(date('now','localtime')) AS INTEGER)
                             AS remaining_days
                    FROM contracts c
-                   WHERE c.person_id=? OR c.person_name=?
+                   WHERE c.is_deleted=0 AND (c.person_id=? OR c.person_name=?)
                    ORDER BY c.end_date DESC""",
                 (matched_person["id"], matched_person["name"]),
             ).fetchall()
             person_risks = db.execute(
                 """SELECT * FROM risks
-                   WHERE person_id=? OR contract_id IN
-                     (SELECT contract_id FROM contracts WHERE person_id=? OR person_name=?)
+                   WHERE is_deleted=0 AND (person_id=? OR contract_id IN
+                     (SELECT contract_id FROM contracts WHERE is_deleted=0 AND (person_id=? OR person_name=?)))
                    ORDER BY CASE risk_level WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END""",
                 (matched_person["id"], matched_person["id"], matched_person["name"]),
             ).fetchall()
@@ -2212,7 +2341,7 @@ def index(default_view="overview"):
                 "current_status": f"{quota['quota_type']} · 当前人员 {quota['person_name'] or '暂无'} · 剩余 {quota['remaining_months']} 个月",
                 "next_action": "建议释放或替补" if quota_risk else "继续按当前使用记录跟进",
                 "needs_action": "Yes" if quota_risk else "No",
-                "detail_url": url_for("quota_detail", quota_id=quota["id"]),
+                "detail_url": url_for("quota.detail", quota_id=quota["id"]),
             }
         elif search_results["events"]:
             event = search_results["events"][0]
@@ -2224,11 +2353,11 @@ def index(default_view="overview"):
                 "needs_action": "Yes" if is_entry else "No",
                 "detail_url": url_for("index", view="events", q=event["person_name"]),
             }
-    all_people = db.execute("SELECT id, name FROM people ORDER BY name").fetchall()
+    all_people = db.execute("SELECT id, name FROM people WHERE is_deleted=0 ORDER BY name").fetchall()
     available_people = db.execute(
         """SELECT p.id, p.name FROM people p
-           LEFT JOIN quotas q ON q.person_id = p.id
-           WHERE q.id IS NULL ORDER BY p.name"""
+           LEFT JOIN quotas q ON q.person_id = p.id AND q.is_deleted=0
+           WHERE p.is_deleted=0 AND q.id IS NULL ORDER BY p.name"""
     ).fetchall()
 
     return render_template(
@@ -2260,6 +2389,7 @@ def index(default_view="overview"):
         task_statuses=TASK_STATUSES,
         active_view=active_view,
         document_keyword=document_keyword,
+        import_result=import_result,
         today=date.today().isoformat(),
     )
 
@@ -2315,17 +2445,17 @@ def upload_person_excel():
                 )
                 if id_last4:
                     duplicate = db.execute(
-                        "SELECT 1 FROM people WHERE name=? AND id_last4=? LIMIT 1",
+                        "SELECT 1 FROM people WHERE name=? AND id_last4=? AND is_deleted=0 LIMIT 1",
                         (name, id_last4),
                     ).fetchone()
                 elif permit_last4:
                     duplicate = db.execute(
-                        "SELECT 1 FROM people WHERE name=? AND permit_last4=? LIMIT 1",
+                        "SELECT 1 FROM people WHERE name=? AND permit_last4=? AND is_deleted=0 LIMIT 1",
                         (name, permit_last4),
                     ).fetchone()
                 else:
                     duplicate = db.execute(
-                        """SELECT 1 FROM people WHERE name=? AND gender=?
+                        """SELECT 1 FROM people WHERE name=? AND gender=? AND is_deleted=0
                            AND COALESCE(company_name,'')=COALESCE(?,'') LIMIT 1""",
                         (name, gender, company_name),
                     ).fetchone()
@@ -2399,7 +2529,7 @@ def upload_quota_excel():
                 user_id = None
                 if user_name:
                     matches = db.execute(
-                        "SELECT id FROM people WHERE name=? ORDER BY id LIMIT 2",
+                        "SELECT id FROM people WHERE name=? AND is_deleted=0 ORDER BY id LIMIT 2",
                         (user_name,),
                     ).fetchall()
                     if not matches:
@@ -2410,18 +2540,18 @@ def upload_quota_excel():
                 if quota_no:
                     duplicate = db.execute(
                         """SELECT 1 FROM quotas
-                           WHERE quota_serial=? OR quota_number=? LIMIT 1""",
+                           WHERE is_deleted=0 AND (quota_serial=? OR quota_number=?) LIMIT 1""",
                         (quota_no, quota_no),
                     ).fetchone()
                 elif approval_no:
                     duplicate = db.execute(
-                        """SELECT 1 FROM quotas WHERE approval_number=?
+                        """SELECT 1 FROM quotas WHERE is_deleted=0 AND approval_number=?
                            AND quota_type=? AND company_name=? LIMIT 1""",
                         (approval_no, quota_type, company_name),
                     ).fetchone()
                 else:
                     duplicate = db.execute(
-                        """SELECT 1 FROM quotas WHERE quota_type=? AND company_name=?
+                        """SELECT 1 FROM quotas WHERE is_deleted=0 AND quota_type=? AND company_name=?
                            AND COALESCE(person_id,0)=COALESCE(?,0)
                            AND COALESCE(start_date,'')=COALESCE(?,'')
                            AND COALESCE(expiry_date,'')=COALESCE(?,'') LIMIT 1""",
@@ -2496,14 +2626,15 @@ def dashboard_status():
     generate_lifecycle_nodes(db)
     quota_rows = db.execute(
         """SELECT q.*, p.name AS person_name FROM quotas q
-           LEFT JOIN people p ON p.id=q.person_id ORDER BY q.id DESC"""
+           LEFT JOIN people p ON p.id=q.person_id AND p.is_deleted=0
+           WHERE q.is_deleted=0 ORDER BY q.id DESC"""
     ).fetchall()
     quota_views = build_quota_views(db, quota_rows)
     refresh_risks(db, quota_views)
     certificate_due_count = 0
     certificate_horizon = date.today() + timedelta(days=90)
     for row in db.execute(
-        "SELECT reason FROM risks WHERE status='开放' AND risk_type LIKE '证件%'"
+        "SELECT reason FROM risks WHERE is_deleted=0 AND status='开放' AND risk_type LIKE '证件%'"
     ).fetchall():
         for value in re.findall(r"\d{4}-\d{2}-\d{2}", row["reason"]):
             try:
@@ -2515,23 +2646,23 @@ def dashboard_status():
                 break
     payload = {
         "risks": {
-            "open": db.execute("SELECT COUNT(*) FROM risks WHERE status='开放'").fetchone()[0],
+            "open": db.execute("SELECT COUNT(*) FROM risks WHERE is_deleted=0 AND status='开放'").fetchone()[0],
             "high": db.execute(
-                "SELECT COUNT(*) FROM risks WHERE status='开放' AND risk_level='高'"
+                "SELECT COUNT(*) FROM risks WHERE is_deleted=0 AND status='开放' AND risk_level='高'"
             ).fetchone()[0],
             "medium": db.execute(
-                "SELECT COUNT(*) FROM risks WHERE status='开放' AND risk_level='中'"
+                "SELECT COUNT(*) FROM risks WHERE is_deleted=0 AND status='开放' AND risk_level='中'"
             ).fetchone()[0],
             "low": db.execute(
-                "SELECT COUNT(*) FROM risks WHERE status='开放' AND risk_level='低'"
+                "SELECT COUNT(*) FROM risks WHERE is_deleted=0 AND status='开放' AND risk_level='低'"
             ).fetchone()[0],
         },
         "tasks": {
-            "open": db.execute("SELECT COUNT(*) FROM tasks WHERE status!='已完成'").fetchone()[0],
-            "overdue": db.execute("SELECT COUNT(*) FROM tasks WHERE status='逾期'").fetchone()[0],
+            "open": db.execute("SELECT COUNT(*) FROM tasks WHERE is_deleted=0 AND status!='已完成'").fetchone()[0],
+            "overdue": db.execute("SELECT COUNT(*) FROM tasks WHERE is_deleted=0 AND status='逾期'").fetchone()[0],
         },
         "contracts_90": db.execute(
-            """SELECT COUNT(*) FROM contracts WHERE status!='完成合约'
+            """SELECT COUNT(*) FROM contracts WHERE is_deleted=0 AND status!='完成合约'
                AND date(end_date) BETWEEN date('now','localtime')
                                       AND date('now','localtime','+90 days')"""
         ).fetchone()[0],
@@ -2589,11 +2720,16 @@ def legacy_reminder_stream_api():
 def create_contract_renewal_task():
     contract_id = request.form.get("contract_id", "").strip()
     db = get_db()
-    contract = db.execute("SELECT * FROM contracts WHERE contract_id=?", (contract_id,)).fetchone()
+    contract = db.execute(
+        "SELECT * FROM contracts WHERE contract_id=? AND is_deleted=0", (contract_id,)
+    ).fetchone()
     if not contract or not contract["person_id"]:
         flash("合同不存在或尚未关联人员，无法创建续约任务。", "error")
         return redirect(url_for("index"))
-    quota = db.execute("SELECT id FROM quotas WHERE person_id=?", (contract["person_id"],)).fetchone()
+    quota = db.execute(
+        "SELECT id FROM quotas WHERE person_id=? AND is_deleted=0",
+        (contract["person_id"],),
+    ).fetchone()
     source_key = f"DECISION:RENEWAL:{contract['contract_id']}:{contract['end_date']}"
     cursor = db.execute(
         """INSERT OR IGNORE INTO tasks
@@ -2615,8 +2751,8 @@ def create_quota_replacement_flow():
     db = get_db()
     risk = db.execute(
         """SELECT r.*, q.person_id, q.quota_number FROM risks r
-           JOIN quotas q ON q.id=r.quota_id
-           WHERE r.id=? AND r.status='开放' AND r.risk_type='名额'""",
+           JOIN quotas q ON q.id=r.quota_id AND q.is_deleted=0
+           WHERE r.id=? AND r.is_deleted=0 AND r.status='开放' AND r.risk_type='名额'""",
         (risk_id,),
     ).fetchone()
     if not risk or not risk["person_id"]:
@@ -2624,7 +2760,8 @@ def create_quota_replacement_flow():
         return redirect(url_for("index"))
     existing = db.execute(
         """SELECT workflow_code FROM workflow_instances
-           WHERE quota_id=? AND workflow_name='名额替补流程' AND status='进行中'
+           WHERE quota_id=? AND is_deleted=0
+             AND workflow_name='名额替补流程' AND status='进行中'
            ORDER BY id DESC LIMIT 1""",
         (risk["quota_id"],),
     ).fetchone()
@@ -2649,7 +2786,7 @@ def create_decision_reminder_task():
     title = due_date = source_key = None
     if risk_id:
         risk = db.execute(
-            "SELECT * FROM risks WHERE id=? AND status='开放' AND person_id IS NOT NULL",
+            "SELECT * FROM risks WHERE id=? AND is_deleted=0 AND status='开放' AND person_id IS NOT NULL",
             (risk_id,),
         ).fetchone()
         if risk:
@@ -2667,7 +2804,7 @@ def create_decision_reminder_task():
                 source_key = f"DECISION:RISK:{risk['id']}:{due_date}"
     elif event_id and days_value in {"30", "45", "60"}:
         event = db.execute(
-            "SELECT * FROM events WHERE id=? AND event_type IN ('入境','工人入境')", (event_id,)
+            "SELECT * FROM events WHERE id=? AND is_deleted=0 AND event_type IN ('入境','工人入境')", (event_id,)
         ).fetchone()
         if event:
             try:
@@ -2682,7 +2819,9 @@ def create_decision_reminder_task():
     if not all((person_id, title, due_date, source_key)):
         flash("现有风险或事件数据不足，无法创建提醒任务。", "error")
         return redirect(url_for("index"))
-    quota = db.execute("SELECT id FROM quotas WHERE person_id=?", (person_id,)).fetchone()
+    quota = db.execute(
+        "SELECT id FROM quotas WHERE person_id=? AND is_deleted=0", (person_id,)
+    ).fetchone()
     quota_id = quota["id"] if quota else None
     cursor = db.execute(
         """INSERT OR IGNORE INTO tasks
@@ -2702,8 +2841,8 @@ def contract_detail(contract_id):
         """SELECT c.*, p.id_last4, p.permit_last4,
                   CAST(julianday(c.end_date)-julianday(date('now','localtime')) AS INTEGER)
                     AS remaining_days
-           FROM contracts c LEFT JOIN people p ON p.id=c.person_id
-           WHERE c.contract_id=?""",
+           FROM contracts c LEFT JOIN people p ON p.id=c.person_id AND p.is_deleted=0
+           WHERE c.contract_id=? AND c.is_deleted=0""",
         (contract_id,),
     ).fetchone()
     if not contract:
@@ -2717,33 +2856,36 @@ def contract_detail(contract_id):
     if person_id:
         quota = db.execute(
             """SELECT q.*, p.name AS person_name FROM quotas q
-               LEFT JOIN people p ON p.id=q.person_id WHERE q.person_id=?""",
+               LEFT JOIN people p ON p.id=q.person_id AND p.is_deleted=0
+               WHERE q.person_id=? AND q.is_deleted=0""",
             (person_id,),
         ).fetchone()
         events = db.execute(
-            "SELECT * FROM events WHERE person_id=? ORDER BY created_at DESC, id DESC",
+            "SELECT * FROM events WHERE person_id=? AND is_deleted=0 ORDER BY created_at DESC, id DESC",
             (person_id,),
         ).fetchall()
         workflows = db.execute(
             """SELECT w.*, q.quota_number FROM workflow_instances w
-               JOIN quotas q ON q.id=w.quota_id WHERE w.person_id=? ORDER BY w.id DESC""",
+               JOIN quotas q ON q.id=w.quota_id AND q.is_deleted=0
+               WHERE w.person_id=? AND w.is_deleted=0 ORDER BY w.id DESC""",
             (person_id,),
         ).fetchall()
         documents = db.execute(
             """SELECT d.*, q.quota_number, w.workflow_code FROM documents d
                JOIN quotas q ON q.id=d.quota_id
                JOIN workflow_instances w ON w.id=d.workflow_id
-               WHERE d.person_id=? ORDER BY d.id DESC""",
+               WHERE d.person_id=? AND d.is_deleted=0 AND q.is_deleted=0
+                 AND w.is_deleted=0 ORDER BY d.id DESC""",
             (person_id,),
         ).fetchall()
         tasks = db.execute(
             """SELECT t.*, q.quota_number FROM tasks t
                LEFT JOIN quotas q ON q.id=t.quota_id
-               WHERE t.person_id=? ORDER BY t.due_date""",
+               WHERE t.person_id=? AND t.is_deleted=0 ORDER BY t.due_date""",
             (person_id,),
         ).fetchall()
     risks = db.execute(
-        "SELECT * FROM risks WHERE contract_id=? ORDER BY id DESC", (contract_id,)
+        "SELECT * FROM risks WHERE contract_id=? AND is_deleted=0 ORDER BY id DESC", (contract_id,)
     ).fetchall()
     return render_template(
         "contract_detail.html", contract=contract, quota=quota, events=events,
@@ -2781,39 +2923,6 @@ def update_contract_status(contract_id):
     return redirect(url_for("contract_detail", contract_id=contract_id))
 
 
-@app.get("/quotas/<int:quota_id>")
-def quota_detail(quota_id):
-    db = get_db()
-    row = db.execute(
-        """SELECT q.*, p.name AS person_name FROM quotas q
-           LEFT JOIN people p ON p.id=q.person_id WHERE q.id=?""",
-        (quota_id,),
-    ).fetchone()
-    if not row:
-        abort(404)
-    quota = build_quota_views(db, [row])[0]
-    related = {
-        "workflows": db.execute(
-            """SELECT w.*, p.name AS person_name FROM workflow_instances w
-               JOIN people p ON p.id=w.person_id WHERE w.quota_id=? ORDER BY w.id DESC""",
-            (quota_id,),
-        ).fetchall(),
-        "documents": db.execute(
-            """SELECT d.*, p.name AS person_name FROM documents d
-               JOIN people p ON p.id=d.person_id WHERE d.quota_id=? ORDER BY d.id DESC""",
-            (quota_id,),
-        ).fetchall(),
-        "risks": db.execute(
-            "SELECT * FROM risks WHERE quota_id=? ORDER BY id DESC", (quota_id,)
-        ).fetchall(),
-    }
-    people = db.execute("SELECT id, name FROM people ORDER BY name").fetchall()
-    return render_template(
-        "quota_detail.html", quota=quota, related=related, people=people,
-        today=date.today().isoformat(),
-    )
-
-
 @app.post("/contracts")
 def add_contract():
     contract_id = request.form.get("contract_id", "").strip()
@@ -2831,12 +2940,12 @@ def add_contract():
         return redirect(url_for("index"))
     db = get_db()
     if person_id:
-        person = db.execute("SELECT id, name FROM people WHERE id = ?", (person_id,)).fetchone()
+        person = db.execute("SELECT id, name FROM people WHERE id=? AND is_deleted=0", (person_id,)).fetchone()
         if not person:
             flash("选择的人员不存在。", "error")
             return redirect(url_for("index"))
         person_name = person["name"]
-    quota = db.execute("SELECT * FROM quotas WHERE id=?", (quota_id,)).fetchone()
+    quota = db.execute("SELECT * FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)).fetchone()
     if not quota or quota["status"] in {"invalid", "exhausted"}:
         flash("配额不存在、已失效或已耗尽。", "error")
         return redirect(url_for("index"))
@@ -2890,10 +2999,10 @@ def add_renewal():
     submission_deadline = shift_months(contract_end, -1)
     status = determine_renewal_status(contract_end, passport_check, id_card_check)
     db = get_db()
-    if not db.execute("SELECT 1 FROM people WHERE id = ?", (person_id,)).fetchone():
+    if not db.execute("SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)).fetchone():
         flash("选择的人员不存在。", "error")
         return redirect(url_for("index"))
-    if not db.execute("SELECT 1 FROM quotas WHERE id = ?", (quota_id,)).fetchone():
+    if not db.execute("SELECT 1 FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)).fetchone():
         flash("选择的名额不存在。", "error")
         return redirect(url_for("index"))
     db.execute(
@@ -2971,7 +3080,7 @@ def add_quota():
         if expiry_date:
             datetime.strptime(expiry_date, "%Y-%m-%d")
         if person_id and not db.execute(
-            "SELECT 1 FROM people WHERE id=?", (person_id,)
+            "SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)
         ).fetchone():
             raise ValueError("使用人不存在")
         cursor = db.execute(
@@ -3006,7 +3115,7 @@ def add_quota():
 @app.post("/quotas/<int:quota_id>/details")
 def update_quota_details(quota_id):
     db = get_db()
-    quota = db.execute("SELECT * FROM quotas WHERE id=?", (quota_id,)).fetchone()
+    quota = db.execute("SELECT * FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)).fetchone()
     if not quota:
         abort(404)
     company_name = request.form.get("company_name", "").strip()
@@ -3017,12 +3126,12 @@ def update_quota_details(quota_id):
     expiry_date = request.form.get("expiry_date", "").strip() or None
     if not company_name or quota_type not in QUOTA_TYPES:
         flash("请填写公司名并选择有效的配额类型。", "error")
-        return redirect(url_for("quota_detail", quota_id=quota_id))
+        return redirect(url_for("quota.detail", quota_id=quota_id))
     try:
         if expiry_date:
             datetime.strptime(expiry_date, "%Y-%m-%d")
         if person_id and not db.execute(
-            "SELECT 1 FROM people WHERE id=?", (person_id,)
+            "SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)
         ).fetchone():
             raise ValueError("使用人不存在")
         active = db.execute(
@@ -3051,9 +3160,9 @@ def update_quota_details(quota_id):
     except (sqlite3.IntegrityError, ValueError) as error:
         db.rollback()
         flash(str(error) or "配额资料更新失败。", "error")
-        return redirect(url_for("quota_detail", quota_id=quota_id))
+        return redirect(url_for("quota.detail", quota_id=quota_id))
     flash("配额资料已更新。", "success")
-    return redirect(url_for("quota_detail", quota_id=quota_id))
+    return redirect(url_for("quota.detail", quota_id=quota_id))
 
 
 @app.post("/quotas/<int:quota_id>/assign")
@@ -3061,7 +3170,7 @@ def assign_quota(quota_id):
     return_to_detail = request.form.get("return_to") == "detail"
 
     def destination():
-        return url_for("quota_detail", quota_id=quota_id) if return_to_detail else url_for("index", view="quotas")
+        return url_for("quota.detail", quota_id=quota_id) if return_to_detail else url_for("index", view="quotas")
 
     person_id = request.form.get("person_id", "").strip()
     start_date = request.form.get("start_date", "").strip()
@@ -3077,8 +3186,12 @@ def assign_quota(quota_id):
     db = get_db()
     try:
         db.execute("BEGIN IMMEDIATE")
-        quota = db.execute("SELECT * FROM quotas WHERE id = ?", (quota_id,)).fetchone()
-        person = db.execute("SELECT id, name FROM people WHERE id = ?", (person_id,)).fetchone()
+        quota = db.execute(
+            "SELECT * FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)
+        ).fetchone()
+        person = db.execute(
+            "SELECT id, name FROM people WHERE id=? AND is_deleted=0", (person_id,)
+        ).fetchone()
         if not quota or not person:
             raise ValueError("名额或人员不存在")
         if str(quota["person_id"] or "") == str(person_id):
@@ -3155,7 +3268,7 @@ def add_event():
         )
         if event_type in CONTRACT_LIFECYCLE:
             contract = db.execute(
-                """SELECT contract_id FROM contracts WHERE person_id=?
+                """SELECT contract_id FROM contracts WHERE person_id=? AND is_deleted=0
                    ORDER BY cycle_index DESC,created_at DESC LIMIT 1""",
                 (person_id,),
             ).fetchone()
@@ -3200,8 +3313,8 @@ def create_workflow():
     if not person_id or not quota_id or not workflow_name:
         flash("请完整填写流程信息。", "error")
         return redirect(url_for("index", view="workflows"))
-    if not db.execute("SELECT 1 FROM people WHERE id=?", (person_id,)).fetchone() or not db.execute(
-        "SELECT 1 FROM quotas WHERE id=?", (quota_id,)
+    if not db.execute("SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)).fetchone() or not db.execute(
+        "SELECT 1 FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)
     ).fetchone():
         flash("人员或名额不存在。", "error")
         return redirect(url_for("index", view="workflows"))
@@ -3226,7 +3339,8 @@ def workflow_step_action(step_id):
     db = get_db()
     step = db.execute(
         """SELECT s.*, w.person_id, w.quota_id FROM workflow_steps s
-           JOIN workflow_instances w ON w.id=s.workflow_id WHERE s.id=?""",
+           JOIN workflow_instances w ON w.id=s.workflow_id
+           WHERE s.id=? AND w.is_deleted=0""",
         (step_id,),
     ).fetchone()
     if not step or step["status"] != "待处理":
@@ -3245,7 +3359,7 @@ def workflow_step_action(step_id):
     else:
         contract = db.execute(
             """SELECT contract_id FROM contracts
-               WHERE person_id=? AND quota_id=?
+               WHERE person_id=? AND quota_id=? AND is_deleted=0
                ORDER BY cycle_index DESC,created_at DESC LIMIT 1""",
             (step["person_id"], step["quota_id"]),
         ).fetchone()
@@ -3267,7 +3381,8 @@ def workflow_step_action(step_id):
         if step["step_name"] == "工人入境":
             existing_arrival = db.execute(
                 """SELECT event_date FROM events
-                   WHERE person_id=? AND event_type IN ('入境','工人入境')
+                   WHERE person_id=? AND is_deleted=0
+                     AND event_type IN ('入境','工人入境')
                    ORDER BY event_date DESC, id DESC LIMIT 1""",
                 (step["person_id"],),
             ).fetchone()
@@ -3350,7 +3465,9 @@ def upload_document():
 
 @app.get("/documents/<int:document_id>/download")
 def download_document(document_id):
-    document = get_db().execute("SELECT * FROM documents WHERE id=?", (document_id,)).fetchone()
+    document = get_db().execute(
+        "SELECT * FROM documents WHERE id=? AND is_deleted=0", (document_id,)
+    ).fetchone()
     if not document:
         return "Not found", 404
     return send_from_directory(
@@ -3388,6 +3505,148 @@ def update_task_status(task_id):
     return redirect(url_for("index", view="tasks"))
 
 
+@app.delete("/api/<resource>/<resource_id>")
+def soft_delete_resource(resource, resource_id):
+    canonical = SOFT_DELETE_ALIASES.get(resource, resource)
+    definition = SOFT_DELETE_RESOURCES.get(canonical)
+    if not definition:
+        return api_response(404, "不支持的删除资源", None, 404)
+    table, primary_key, mirror_table, mirror_key = definition
+    value = resource_id
+    if primary_key == "id":
+        try:
+            value = int(resource_id)
+        except ValueError:
+            return api_response(400, "资源编号无效", None, 400)
+    db = get_db()
+    try:
+        cursor = db.execute(
+            f"""UPDATE {table}
+                SET is_deleted=1, deleted_at=CURRENT_TIMESTAMP, deleted_by=?
+                WHERE {primary_key}=? AND is_deleted=0""",
+            (session.get("user_id"), value),
+        )
+        if cursor.rowcount == 0:
+            db.rollback()
+            return api_response(404, "记录不存在或已经删除", None, 404)
+        if mirror_table:
+            db.execute(
+                f"""UPDATE {mirror_table}
+                    SET is_deleted=1, deleted_at=CURRENT_TIMESTAMP, deleted_by=?
+                    WHERE {mirror_key}=? AND is_deleted=0""",
+                (session.get("user_id"), value),
+            )
+        db.commit()
+    except sqlite3.Error:
+        db.rollback()
+        app.logger.exception(
+            "Soft delete failed: resource=%s id=%s", canonical, resource_id
+        )
+        return api_response(500, "删除失败，请稍后重试", None, 500)
+    return api_response(
+        0,
+        "已删除",
+        {"resource": canonical, "id": value},
+    )
+
+
+@app.post("/api/<resource>/<resource_id>/restore")
+def restore_resource(resource, resource_id):
+    canonical = SOFT_DELETE_ALIASES.get(resource, resource)
+    definition = SOFT_DELETE_RESOURCES.get(canonical)
+    if not definition:
+        return api_response(404, "不支持的恢复资源", None, 404)
+    table, primary_key, mirror_table, mirror_key = definition
+    try:
+        value = int(resource_id) if primary_key == "id" else resource_id
+    except ValueError:
+        return api_response(400, "资源编号无效", None, 400)
+    db = get_db()
+    cursor = db.execute(
+        f"""UPDATE {table} SET is_deleted=0,deleted_at=NULL,deleted_by=NULL
+            WHERE {primary_key}=? AND is_deleted=1""",
+        (value,),
+    )
+    if cursor.rowcount == 0:
+        db.rollback()
+        return api_response(404, "回收站中没有该记录", None, 404)
+    if mirror_table:
+        db.execute(
+            f"""UPDATE {mirror_table}
+                SET is_deleted=0,deleted_at=NULL,deleted_by=NULL
+                WHERE {mirror_key}=?""",
+            (value,),
+        )
+    db.commit()
+    return api_response(0, "已恢复", {"resource": canonical, "id": value})
+
+
+@app.delete("/api/<resource>/<resource_id>/permanent")
+def permanently_delete_resource(resource, resource_id):
+    canonical = SOFT_DELETE_ALIASES.get(resource, resource)
+    definition = SOFT_DELETE_RESOURCES.get(canonical)
+    if not definition:
+        return api_response(404, "不支持的删除资源", None, 404)
+    table, primary_key, mirror_table, mirror_key = definition
+    try:
+        value = int(resource_id) if primary_key == "id" else resource_id
+    except ValueError:
+        return api_response(400, "资源编号无效", None, 400)
+    db = get_db()
+    try:
+        if mirror_table:
+            db.execute(
+                f"DELETE FROM {mirror_table} WHERE {mirror_key}=? AND is_deleted=1",
+                (value,),
+            )
+        cursor = db.execute(
+            f"DELETE FROM {table} WHERE {primary_key}=? AND is_deleted=1",
+            (value,),
+        )
+        if cursor.rowcount == 0:
+            db.rollback()
+            return api_response(404, "回收站中没有该记录", None, 404)
+        db.commit()
+    except sqlite3.IntegrityError:
+        db.rollback()
+        return api_response(409, "存在关联历史，请先处理关联记录", None, 409)
+    return api_response(0, "已永久删除", {"resource": canonical, "id": value})
+
+
+@app.get("/recycle-bin")
+def recycle_bin_page():
+    db = get_db()
+    users = {
+        row["id"]: row["username"]
+        for row in db.execute("SELECT id,username FROM users").fetchall()
+    }
+    items = []
+    for resource, (table, primary_key, _mirror_table, _mirror_key) in SOFT_DELETE_RESOURCES.items():
+        rows = db.execute(
+            f"""SELECT {primary_key} AS entity_id,deleted_at,deleted_by
+                FROM {table} WHERE is_deleted=1 ORDER BY deleted_at DESC"""
+        ).fetchall()
+        for row in rows:
+            items.append({
+                "resource": resource,
+                "entity_id": row["entity_id"],
+                "deleted_at": row["deleted_at"],
+                "deleted_by": users.get(row["deleted_by"], "系统/未知"),
+            })
+    items.sort(key=lambda item: item["deleted_at"] or "", reverse=True)
+    return render_template("recycle_bin.html", items=items)
+
+
+@app.get("/audit-logs")
+def audit_logs_page():
+    rows = get_db().execute(
+        """SELECT a.*,u.username FROM audit_logs a
+           LEFT JOIN users u ON u.id=a.user_id
+           ORDER BY a.id DESC LIMIT 500"""
+    ).fetchall()
+    return render_template("audit_logs.html", audit_logs=rows)
+
+
 @app.patch("/api/people/<int:person_id>")
 def api_update_person(person_id):
     payload = request.get_json(silent=True) or {}
@@ -3398,7 +3657,9 @@ def api_update_person(person_id):
     if not name or gender not in {"男", "女"}:
         return api_response(400, "姓名必填，性别必须为男或女。", None, 400)
     db = get_db()
-    person = db.execute("SELECT id FROM people WHERE id=?", (person_id,)).fetchone()
+    person = db.execute(
+        "SELECT id FROM people WHERE id=? AND is_deleted=0", (person_id,)
+    ).fetchone()
     if not person:
         return api_response(404, "人员不存在。", None, 404)
     try:
@@ -3427,7 +3688,8 @@ def api_update_contract(contract_id):
         return api_response(400, "公司必填，合同状态无效。", None, 400)
     db = get_db()
     contract = db.execute(
-        "SELECT contract_id, person_id FROM contracts WHERE contract_id=?", (contract_id,)
+        "SELECT contract_id, person_id FROM contracts WHERE contract_id=? AND is_deleted=0",
+        (contract_id,),
     ).fetchone()
     if not contract:
         return api_response(404, "合同不存在。", None, 404)
@@ -3467,7 +3729,9 @@ def api_update_quota(quota_id):
         except ValueError:
             return api_response(400, "批文有效期格式无效。", None, 400)
     db = get_db()
-    quota = db.execute("SELECT * FROM quotas WHERE id=?", (quota_id,)).fetchone()
+    quota = db.execute(
+        "SELECT * FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)
+    ).fetchone()
     if not quota:
         return api_response(404, "名额不存在。", None, 404)
     try:

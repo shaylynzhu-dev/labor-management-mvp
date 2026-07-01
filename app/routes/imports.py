@@ -34,25 +34,31 @@ def _import(kind, view):
         f"导入完成：成功 {result['success']}，跳过 {result['skipped']}，失败 {result['failed']}。",
         "success" if result["failed"] == 0 else "error",
     )
-    return redirect(url_for("index", view=view))
+    return redirect(url_for("index", view=view, import_log=result["log_id"]))
 
 
 @imports_bp.post("/person")
-@roles_required("admin")
+@roles_required("admin", "hr")
 def person_import():
     return _import("person", "people")
 
 
 @imports_bp.post("/quota")
-@roles_required("admin")
+@roles_required("admin", "hr")
 def quota_import():
     return _import("quota", "quotas")
 
 
 @imports_bp.post("/contract")
-@roles_required("admin")
+@roles_required("admin", "hr")
 def contract_import():
     return _import("contract", "contracts")
+
+
+@imports_bp.post("/lifecycle")
+@roles_required("admin", "hr")
+def lifecycle_import():
+    return _import("lifecycle", "quotas")
 
 
 @imports_bp.get("/template/<kind>")
@@ -70,7 +76,7 @@ def download_template(kind):
 
 
 @imports_bp.get("/logs")
-@roles_required("admin")
+@roles_required("admin", "hr")
 def logs():
     rows = current_app.extensions["import_log_repository"].list_recent()
     data = [dict(row) for row in rows]
