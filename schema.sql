@@ -8,10 +8,42 @@ CREATE TABLE IF NOT EXISTS person (
     introducer TEXT NULL,
     id_last4 TEXT NULL,
     hk_macao_last4 TEXT NULL,
+    person_name TEXT NULL,
+    worker_type TEXT NOT NULL DEFAULT 'new' CHECK(worker_type IN ('new','renewal')),
+    birth_date DATE NULL,
+    birth_year_month TEXT NULL,
+    mainland_id_first4 TEXT NULL,
+    mainland_id_last4 TEXT NULL,
+    hkmo_permit_first4 TEXT NULL,
+    hkmo_permit_last6 TEXT NULL,
+    entry_permit_no TEXT NULL,
+    hk_submission_date DATE NULL,
+    visa_status_date DATE NULL,
+    visa_status TEXT NULL,
+    hk_id_appointment_status TEXT NULL,
+    remarks TEXT NULL,
     is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
     deleted_at DATETIME NULL,
     deleted_by INTEGER NULL,
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS person_documents (
+    id INTEGER PRIMARY KEY,
+    person_id INTEGER NOT NULL,
+    document_type TEXT NOT NULL DEFAULT 'other',
+    original_filename TEXT NOT NULL,
+    stored_path TEXT NOT NULL,
+    ocr_text TEXT NOT NULL DEFAULT '',
+    issue_date DATE NULL,
+    expiry_date DATE NULL,
+    uploaded_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    status TEXT NOT NULL DEFAULT 'active',
+    remarks TEXT NULL,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    deleted_at DATETIME NULL,
+    deleted_by INTEGER NULL,
+    FOREIGN KEY(person_id) REFERENCES person(id) ON DELETE RESTRICT
 );
 
 CREATE TABLE IF NOT EXISTS quota (

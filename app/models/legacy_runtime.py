@@ -24,6 +24,7 @@ from app.services.dispatch_engine import (
     normalize_contract_status, quota_replacement_limit, register_worker_entry,
     transition_contract, trigger_worker_departure,
 )
+from app.services.person_profile_service import DOCUMENT_TYPES, get_person_profile
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -754,7 +755,7 @@ def close_db(_error=None):
 
 SOFT_DELETE_TABLES = (
     "people", "quotas", "contracts", "events", "renewals",
-    "workflow_instances", "documents", "lifecycle_nodes", "risks", "tasks",
+    "workflow_instances", "documents", "person_documents", "lifecycle_nodes", "risks", "tasks",
     "person", "quota", "contract", "event", "risk",
 )
 
@@ -766,6 +767,7 @@ SOFT_DELETE_RESOURCES = {
     "renewals": ("renewals", "id", None, None),
     "workflows": ("workflow_instances", "id", None, None),
     "documents": ("documents", "id", None, None),
+    "person_documents": ("person_documents", "id", None, None),
     "lifecycle": ("lifecycle_nodes", "id", None, None),
     "risks": ("risks", "id", "risk", "id"),
     "tasks": ("tasks", "id", None, None),
@@ -775,6 +777,7 @@ SOFT_DELETE_ALIASES = {
     "quota": "quotas", "contract": "contracts",
     "event": "events", "renewal": "renewals", "workflow": "workflows",
     "document": "documents", "risk": "risks", "task": "tasks",
+    "person_document": "person_documents", "person-documents": "person_documents",
     "workflow_instances": "workflows", "lifecycle-node": "lifecycle",
     "lifecycle_nodes": "lifecycle",
 }
@@ -955,6 +958,24 @@ def init_db():
             FOREIGN KEY (workflow_id) REFERENCES workflow_instances(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS person_documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL,
+            document_type TEXT NOT NULL DEFAULT 'other',
+            original_filename TEXT NOT NULL,
+            stored_path TEXT NOT NULL,
+            ocr_text TEXT NOT NULL DEFAULT '',
+            issue_date TEXT,
+            expiry_date TEXT,
+            uploaded_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            status TEXT NOT NULL DEFAULT 'active',
+            remarks TEXT,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at DATETIME,
+            deleted_by INTEGER,
+            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE RESTRICT
+        );
+
         CREATE TABLE IF NOT EXISTS lifecycle_nodes (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person_id INTEGER NOT NULL,
@@ -1037,6 +1058,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_renewals_deadline ON renewals(submission_deadline);
         CREATE INDEX IF NOT EXISTS idx_renewals_status ON renewals(status);
         CREATE INDEX IF NOT EXISTS idx_documents_binding ON documents(person_id, quota_id, workflow_id);
+        CREATE INDEX IF NOT EXISTS idx_person_documents_person ON person_documents(person_id,is_deleted);
+        CREATE INDEX IF NOT EXISTS idx_person_documents_type ON person_documents(document_type,status);
         CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflow_instances(status);
         CREATE INDEX IF NOT EXISTS idx_lifecycle_due ON lifecycle_nodes(due_date, status);
         CREATE INDEX IF NOT EXISTS idx_risks_level ON risks(risk_level, status);
@@ -1109,6 +1132,44 @@ def init_db():
     for name in ("visa_number", "hkid"):
         if name not in current_person_columns:
             db.execute(f"ALTER TABLE people ADD COLUMN {name} TEXT")
+
+    profile_columns = {
+        "person_name": "TEXT", "worker_type": "TEXT DEFAULT 'new'",
+        "birth_date": "TEXT", "birth_year_month": "TEXT",
+        "mainland_id_first4": "TEXT", "mainland_id_last4": "TEXT",
+        "hkmo_permit_first4": "TEXT", "hkmo_permit_last6": "TEXT",
+        "entry_permit_no": "TEXT", "hk_submission_date": "TEXT",
+        "visa_status_date": "TEXT", "visa_status": "TEXT",
+        "hk_id_appointment_status": "TEXT", "remarks": "TEXT",
+    }
+    current_person_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(people)").fetchall()
+    }
+    for column, definition in profile_columns.items():
+        if column not in current_person_columns:
+            db.execute(f"ALTER TABLE people ADD COLUMN {column} {definition}")
+    db.execute(
+        """UPDATE people SET person_name=COALESCE(NULLIF(person_name,''),name),
+                  worker_type=CASE WHEN worker_type IN ('new','renewal') THEN worker_type ELSE 'new' END,
+                  mainland_id_last4=COALESCE(mainland_id_last4,id_last4)
+           """
+    )
+
+    document_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(documents)").fetchall()
+    }
+    active_document_filter = "d.is_deleted=0" if "is_deleted" in document_columns else "1=1"
+    db.execute(
+        f"""INSERT INTO person_documents
+           (person_id,document_type,original_filename,stored_path,ocr_text,uploaded_at,status)
+           SELECT d.person_id,'other',d.filename,d.stored_name,d.ocr_text,d.created_at,
+                  CASE WHEN d.ocr_status='待OCR' THEN 'pending_ocr' ELSE 'active' END
+           FROM documents d
+           WHERE {active_document_filter} AND NOT EXISTS (
+               SELECT 1 FROM person_documents pd
+               WHERE pd.person_id=d.person_id AND pd.stored_path=d.stored_name
+           )"""
+    )
 
     # Non-destructive Quota migration. Legacy quota_number values remain intact,
     # while new records may stay intentionally incomplete until details arrive.
@@ -1942,11 +2003,17 @@ def index(default_view="overview"):
                 ORDER BY e.created_at DESC, e.id DESC LIMIT 1) AS latest_event_at
         FROM people p
         LEFT JOIN quotas q ON q.person_id = p.id AND q.is_deleted=0
-        WHERE p.is_deleted=0 AND (? = '' OR p.name LIKE ? OR p.id_last4 LIKE ?
-          OR p.permit_last4 LIKE ? OR COALESCE(q.quota_number, '') LIKE ?)
+        WHERE p.is_deleted=0 AND (? = '' OR p.name LIKE ? OR p.company_name LIKE ?
+          OR p.entry_permit_no LIKE ? OR p.mainland_id_first4 LIKE ?
+          OR p.mainland_id_last4 LIKE ? OR p.hkmo_permit_first4 LIKE ?
+          OR p.hkmo_permit_last6 LIKE ? OR p.visa_status LIKE ?
+          OR p.hk_submission_date LIKE ? OR p.id_last4 LIKE ?
+          OR p.permit_last4 LIKE ? OR COALESCE(q.quota_number, '') LIKE ?
+          OR EXISTS (SELECT 1 FROM person_documents pd WHERE pd.person_id=p.id
+                     AND pd.is_deleted=0 AND (pd.original_filename LIKE ? OR pd.ocr_text LIKE ?)))
         ORDER BY p.id DESC
         """,
-        (keyword, like, like, like, like),
+        (keyword, *([like] * 14)),
     ).fetchall()
 
     quota_rows = db.execute(
@@ -1994,19 +2061,32 @@ def index(default_view="overview"):
         """
     ).fetchall()
 
-    doc_like = f"%{document_keyword}%"
+    effective_document_keyword = document_keyword or keyword
+    doc_like = f"%{effective_document_keyword}%"
     documents = db.execute(
         """
-        SELECT d.*, p.name AS person_name, q.quota_number, w.workflow_code
-        FROM documents d
+        SELECT d.*, p.name AS person_name, p.company_name,
+               COALESCE((SELECT title FROM documents old
+                         WHERE old.stored_name=d.stored_path LIMIT 1),d.original_filename) AS display_title,
+               CASE d.document_type
+                 WHEN 'resume' THEN '简历' WHEN 'contract' THEN '合同'
+                 WHEN 'mainland_id' THEN '国内身份证' WHEN 'hkmo_permit' THEN '港澳通行证'
+                 WHEN 'social_security_statement' THEN '社保声明书'
+                 WHEN 'no_criminal_record' THEN '无犯罪证明'
+                 WHEN 'medical_report' THEN '体检报告' WHEN 'household_register' THEN '户口本'
+                 WHEN 'visa_document' THEN '签证资料'
+                 WHEN 'hk_id_appointment' THEN '香港身份证预约资料'
+                 WHEN 'work_proof' THEN '工作证明' ELSE '其他' END AS document_type_label,
+               CASE WHEN d.expiry_date IS NOT NULL AND date(d.expiry_date)<date('now','localtime')
+                    THEN 1 ELSE 0 END AS is_expired
+        FROM person_documents d
         JOIN people p ON p.id=d.person_id AND p.is_deleted=0
-        JOIN quotas q ON q.id=d.quota_id AND q.is_deleted=0
-        JOIN workflow_instances w ON w.id=d.workflow_id AND w.is_deleted=0
         WHERE d.is_deleted=0
-          AND (?='' OR d.title LIKE ? OR d.filename LIKE ? OR d.ocr_text LIKE ?)
-        ORDER BY d.id DESC
+          AND (?='' OR d.original_filename LIKE ? OR d.ocr_text LIKE ?
+               OR p.name LIKE ? OR p.company_name LIKE ?)
+        ORDER BY d.uploaded_at DESC,d.id DESC
         """,
-        (document_keyword, doc_like, doc_like, doc_like),
+        (effective_document_keyword, doc_like, doc_like, doc_like, doc_like),
     ).fetchall()
     workflows = db.execute(
         """
@@ -2058,7 +2138,7 @@ def index(default_view="overview"):
     ).fetchall()
 
     counts = {
-        "documents": db.execute("SELECT COUNT(*) FROM documents WHERE is_deleted=0").fetchone()[0],
+        "documents": db.execute("SELECT COUNT(*) FROM person_documents WHERE is_deleted=0").fetchone()[0],
         "active_workflows": db.execute(
             "SELECT COUNT(*) FROM workflow_instances WHERE is_deleted=0 AND status='进行中'"
         ).fetchone()[0],
@@ -2272,10 +2352,9 @@ def index(default_view="overview"):
             """SELECT p.*, q.id AS quota_id, q.quota_number, q.quota_type,
                       q.company_name AS quota_company
                FROM people p LEFT JOIN quotas q ON q.person_id=p.id AND q.is_deleted=0
-               WHERE p.is_deleted=0 AND p.name LIKE ?
-               ORDER BY CASE WHEN p.name=? THEN 0 ELSE 1 END, p.id DESC LIMIT 1""",
-            (like, keyword),
-        ).fetchone()
+               WHERE p.is_deleted=0 AND p.id=? LIMIT 1""",
+            (people[0]["id"],),
+        ).fetchone() if people else None
         if matched_person:
             person_contracts = db.execute(
                 """SELECT c.*,
@@ -2319,7 +2398,7 @@ def index(default_view="overview"):
                 ),
                 "next_action": next_action,
                 "needs_action": "Yes" if open_risks else "No",
-                "detail_url": url_for("contracts_page", q=quick_result["person"]["name"]),
+                "detail_url": url_for("person_detail", person_id=quick_result["person"]["id"]),
             }
         elif search_results["contracts"]:
             contract = search_results["contracts"][0]
@@ -2397,6 +2476,65 @@ def index(default_view="overview"):
 @app.get("/people")
 def people_page():
     return index("people")
+
+
+@app.get("/people/<int:person_id>")
+def person_detail(person_id):
+    profile = get_person_profile(
+        get_db(), person_id, can_view_sensitive=session.get("role") == "admin"
+    )
+    if profile is None:
+        abort(404)
+    return render_template("person_detail.html", **profile)
+
+
+@app.post("/people/<int:person_id>/profile")
+def update_person_profile(person_id):
+    db = get_db()
+    if not db.execute(
+        "SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)
+    ).fetchone():
+        abort(404)
+    name = request.form.get("person_name", "").strip()
+    gender = request.form.get("gender", "").strip()
+    worker_type = request.form.get("worker_type", "new").strip()
+    if not name or gender not in {"男", "女"} or worker_type not in {"new", "renewal"}:
+        flash("姓名、性别和人员类型不完整。", "error")
+        return redirect(url_for("person_detail", person_id=person_id))
+    fields = (
+        "company_name", "birth_date", "birth_year_month", "mainland_id_first4",
+        "mainland_id_last4", "hkmo_permit_first4", "hkmo_permit_last6",
+        "entry_permit_no", "hk_submission_date", "visa_status_date", "visa_status",
+        "hk_id_appointment_status", "remarks",
+    )
+    values = [(request.form.get(field) or "").strip() or None for field in fields]
+    fragments = {
+        "身份证前四位": values[3], "身份证后四位": values[4],
+        "通行证前四位": values[5], "通行证后六位": values[6],
+    }
+    expected_lengths = {"身份证前四位": 4, "身份证后四位": 4, "通行证前四位": 4, "通行证后六位": 6}
+    for label, value in fragments.items():
+        if value and (not value.isdigit() or len(value) != expected_lengths[label]):
+            flash(f"{label}必须为{expected_lengths[label]}位数字。", "error")
+            return redirect(url_for("person_detail", person_id=person_id))
+    if values[2] and not re.fullmatch(r"\d{4}-\d{2}", values[2]):
+        flash("出生年月格式必须为 YYYY-MM。", "error")
+        return redirect(url_for("person_detail", person_id=person_id))
+    db.execute(
+        f"""UPDATE people SET name=?,person_name=?,gender=?,worker_type=?,
+                   {','.join(f'{field}=?' for field in fields)},
+                   id_last4=?,permit_last4=? WHERE id=?""",
+        (
+            name, name, gender, worker_type, *values,
+            (request.form.get("mainland_id_last4") or "").strip() or None,
+            ((request.form.get("hkmo_permit_last6") or "").strip()[-4:] or None),
+            person_id,
+        ),
+    )
+    record_standard_event(db, "person_updated", "人员档案字段已更新", person_id=person_id)
+    db.commit()
+    flash("人员档案已保存。", "success")
+    return redirect(url_for("person_detail", person_id=person_id))
 
 
 @app.get("/contracts")
@@ -3035,14 +3173,17 @@ def add_person():
     gender = request.form.get("gender", "").strip()
     company_name = request.form.get("company_name", "").strip() or None
     introducer = request.form.get("introducer", "").strip() or None
+    worker_type = request.form.get("worker_type", "new").strip()
     if not name or gender not in {"男", "女"}:
         flash("请填写人员姓名并选择性别。", "error")
         return redirect(url_for("index"))
     db = get_db()
     cursor = db.execute(
-        """INSERT INTO people (name, gender, company_name, introducer)
-           VALUES (?, ?, ?, ?)""",
-        (name, gender, company_name, introducer),
+        """INSERT INTO people
+           (name,person_name,gender,company_name,introducer,worker_type)
+           VALUES (?,?,?,?,?,?)""",
+        (name, name, gender, company_name, introducer,
+         worker_type if worker_type in {"new", "renewal"} else "new"),
     )
     db.execute(
         """INSERT INTO events
@@ -3427,20 +3568,40 @@ def upload_document():
     person_id = request.form.get("person_id", "").strip()
     quota_id = request.form.get("quota_id", "").strip()
     workflow_id = request.form.get("workflow_id", "").strip()
+    document_type = request.form.get("document_type", "other").strip()
+    issue_date = request.form.get("issue_date", "").strip() or None
+    expiry_date = request.form.get("expiry_date", "").strip() or None
+    remarks = request.form.get("remarks", "").strip() or None
     manual_text = request.form.get("ocr_text", "").strip()
-    if not uploaded or not uploaded.filename or not all((title, person_id, quota_id, workflow_id)):
-        flash("文件必须绑定人员、名额和流程。", "error")
+    db = get_db()
+    if uploaded and uploaded.filename and not person_id:
+        matches = db.execute(
+            "SELECT id FROM people WHERE is_deleted=0 AND instr(?,name)>0 ORDER BY length(name) DESC",
+            (uploaded.filename,),
+        ).fetchall()
+        if len(matches) == 1:
+            person_id = str(matches[0]["id"])
+    if not uploaded or not uploaded.filename or not title or not person_id:
+        flash("文件必须绑定具体人员。", "error")
         return redirect(url_for("index", view="documents"))
-    filename = secure_filename(uploaded.filename)
-    extension = filename.rsplit(".", 1)[-1].lower() if "." in filename else ""
-    if not filename or extension not in ALLOWED_DOCUMENT_EXTENSIONS:
+    if document_type not in DOCUMENT_TYPES:
+        document_type = "other"
+    try:
+        for value in (issue_date, expiry_date):
+            if value:
+                datetime.strptime(value, "%Y-%m-%d")
+    except ValueError:
+        flash("资料签发日期或到期日期格式无效。", "error")
+        return redirect(url_for("index", view="documents"))
+    original_filename = Path(uploaded.filename).name
+    extension = original_filename.rsplit(".", 1)[-1].lower() if "." in original_filename else ""
+    filename = secure_filename(original_filename) or f"document.{extension}"
+    if extension not in ALLOWED_DOCUMENT_EXTENSIONS:
         flash("仅支持 TXT、图片和 PDF 文件。", "error")
         return redirect(url_for("index", view="documents"))
-    db = get_db()
-    for table, record_id in (("people", person_id), ("quotas", quota_id), ("workflow_instances", workflow_id)):
-        if not db.execute(f"SELECT 1 FROM {table} WHERE id=?", (record_id,)).fetchone():
-            flash("文件绑定对象不存在。", "error")
-            return redirect(url_for("index", view="documents"))
+    if not db.execute("SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)).fetchone():
+        flash("绑定人员不存在。", "error")
+        return redirect(url_for("index", view="documents"))
     stored_name = f"{uuid.uuid4().hex}_{filename}"
     path = Path(app.config["UPLOAD_FOLDER"]) / stored_name
     uploaded.save(path)
@@ -3453,14 +3614,60 @@ def upload_document():
             ocr_text, ocr_status = "", "待OCR"
     mime_type = uploaded.mimetype or mimetypes.guess_type(filename)[0] or "application/octet-stream"
     db.execute(
-        """INSERT INTO documents
-           (title,filename,stored_name,mime_type,person_id,quota_id,workflow_id,ocr_text,ocr_status)
+        """INSERT INTO person_documents
+           (person_id,document_type,original_filename,stored_path,ocr_text,
+            issue_date,expiry_date,status,remarks)
            VALUES (?,?,?,?,?,?,?,?,?)""",
-        (title, filename, stored_name, mime_type, person_id, quota_id, workflow_id, ocr_text, ocr_status),
+        (person_id, document_type, original_filename, stored_name, ocr_text, issue_date,
+         expiry_date, "pending_ocr" if ocr_status == "待OCR" else "active", remarks),
     )
+    if quota_id and workflow_id:
+        valid_quota = db.execute(
+            "SELECT 1 FROM quotas WHERE id=? AND is_deleted=0", (quota_id,)
+        ).fetchone()
+        valid_workflow = db.execute(
+            "SELECT 1 FROM workflow_instances WHERE id=? AND is_deleted=0", (workflow_id,)
+        ).fetchone()
+        if valid_quota and valid_workflow:
+            db.execute(
+                """INSERT INTO documents
+                   (title,filename,stored_name,mime_type,person_id,quota_id,workflow_id,ocr_text,ocr_status)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (title, original_filename, stored_name, mime_type, person_id, quota_id,
+                 workflow_id, ocr_text, ocr_status),
+            )
     db.commit()
     flash(f"文件已入库，OCR状态：{ocr_status}", "success")
-    return redirect(url_for("index", view="documents"))
+    return redirect(
+        url_for("person_detail", person_id=person_id)
+        if request.form.get("return_to") == "person"
+        else url_for("index", view="documents")
+    )
+
+
+@app.get("/person-documents/<int:document_id>/download")
+def download_person_document(document_id):
+    document = get_db().execute(
+        "SELECT * FROM person_documents WHERE id=? AND is_deleted=0", (document_id,)
+    ).fetchone()
+    if not document:
+        abort(404)
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"], document["stored_path"],
+        as_attachment=True, download_name=document["original_filename"],
+    )
+
+
+@app.get("/person-documents/<int:document_id>/view")
+def view_person_document(document_id):
+    document = get_db().execute(
+        "SELECT * FROM person_documents WHERE id=? AND is_deleted=0", (document_id,)
+    ).fetchone()
+    if not document:
+        abort(404)
+    return send_from_directory(
+        app.config["UPLOAD_FOLDER"], document["stored_path"], as_attachment=False,
+    )
 
 
 @app.get("/documents/<int:document_id>/download")
@@ -3664,9 +3871,9 @@ def api_update_person(person_id):
         return api_response(404, "人员不存在。", None, 404)
     try:
         db.execute(
-            """UPDATE people SET name=?, gender=?, company_name=?, introducer=?
+            """UPDATE people SET name=?, person_name=?, gender=?, company_name=?, introducer=?
                WHERE id=?""",
-            (name, gender, company_name, introducer, person_id),
+            (name, name, gender, company_name, introducer, person_id),
         )
         record_standard_event(
             db, "person_updated", f"人员资料已更新：{name}", person_id=person_id,

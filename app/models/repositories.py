@@ -71,7 +71,7 @@ class LegacyBusinessRepository:
         elif permit_last4:
             sql, values = "SELECT 1 FROM people WHERE name=? AND permit_last4=? AND is_deleted=0", (name, permit_last4)
         else:
-            sql = """SELECT 1 FROM people WHERE name=? AND gender=? AND is_deleted=0
+            sql = """SELECT 1 FROM people WHERE name=? AND COALESCE(gender,'')=COALESCE(?,'') AND is_deleted=0
                      AND COALESCE(company_name,'')=COALESCE(?,'')"""
             values = (name, gender, company)
         return connection.execute(sql + " LIMIT 1", values).fetchone() is not None

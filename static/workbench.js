@@ -111,4 +111,21 @@
       }
     });
   });
+
+  const documentFile = document.querySelector('[data-person-document-file]');
+  const documentPerson = document.querySelector('[data-person-document-person]');
+  const documentSuggestion = document.querySelector('[data-person-document-suggestion]');
+  documentFile?.addEventListener('change', () => {
+    const filename = documentFile.files?.[0]?.name || '';
+    const matches = Array.from(documentPerson?.options || []).filter(
+      (option) => option.dataset.personName && filename.includes(option.dataset.personName),
+    );
+    if (matches.length === 1) {
+      documentPerson.value = matches[0].value;
+      documentSuggestion.textContent = `已按文件名推荐绑定：${matches[0].dataset.personName}`;
+      documentSuggestion.hidden = false;
+    } else if (documentSuggestion) {
+      documentSuggestion.hidden = true;
+    }
+  });
 })();

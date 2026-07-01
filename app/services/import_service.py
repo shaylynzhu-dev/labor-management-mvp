@@ -11,9 +11,18 @@ from app.services.dispatch_engine import (
 
 DEFAULT_MAPPINGS = {
     "person": {
-        "name": "姓名", "gender": "性别", "company_name": "公司名",
+        "name": "劳工姓名", "gender": "性别", "company_name": "公司名称",
         "introducer": "介绍人", "id_last4": "身份证后四位",
         "permit_last4": "港澳通行证后四位",
+        "worker_type": "人员类型", "entry_permit_no": "入境签证号码",
+        "birth_date": "出生日期", "birth_year_month": "出生年月",
+        "mainland_id_first4": "身份证前四位",
+        "mainland_id_last4": "身份证后四位",
+        "hkmo_permit_first4": "通行证前四位",
+        "hkmo_permit_last6": "通行证后六位",
+        "hk_submission_date": "HK入表日期",
+        "visa_status_date": "出VISA情况日期", "visa_status": "VISA状态",
+        "remarks": "备注",
     },
     "quota": {
         "quota_type": "配额类型", "company_name": "公司名",
@@ -32,6 +41,19 @@ DEFAULT_MAPPINGS = {
         "entry_date": "入境日期", "contract_end_date": "合同结束日期",
         "employment_status": "状态", "note": "备注",
     },
+}
+
+PERSON_COLUMN_ALIASES = {
+    "name": ("劳工姓名", "姓名", "人员姓名"),
+    "company_name": ("公司名称", "公司名"),
+    "worker_type": ("人员类型",), "entry_permit_no": ("入境签证号码", "入境编号"),
+    "birth_date": ("出生日期",), "birth_year_month": ("出生年月",),
+    "mainland_id_first4": ("身份证前四位",), "mainland_id_last4": ("身份证后四位",),
+    "hkmo_permit_first4": ("通行证前四位", "港澳通行证前四位"),
+    "hkmo_permit_last6": ("通行证后六位", "港澳通行证后六位"),
+    "hk_submission_date": ("HK入表日期",), "visa_status_date": ("出VISA情况日期",),
+    "visa_status": ("VISA状态",), "remarks": ("备注",), "gender": ("性别",),
+    "introducer": ("介绍人",), "permit_last4": ("港澳通行证后四位",),
 }
 
 
@@ -76,14 +98,29 @@ class ExcelImportService:
             raise ValueError("证件后四位必须为4位数字")
         return text
 
+    @staticmethod
+    def _digits(value, length, label):
+        text = ExcelImportService._text(value)
+        if text is None:
+            return None
+        if not text.isdigit() or len(text) != length:
+            raise ValueError(f"{label}必须为{length}位数字")
+        return text
+
     def _frame(self, kind, uploaded, mapping):
         pd = _pandas()
         validate_excel_upload(uploaded)
         frame = pd.read_excel(uploaded, engine="openpyxl", dtype=object).dropna(how="all")
         validate_excel_shape(frame)
         frame.columns = [str(column).strip() for column in frame.columns]
+        if kind == "person":
+            for key, aliases in PERSON_COLUMN_ALIASES.items():
+                if mapping.get(key) not in frame.columns:
+                    matched = next((column for column in aliases if column in frame.columns), None)
+                    if matched:
+                        mapping[key] = matched
         required_keys = {
-            "person": {"name", "gender"},
+            "person": {"name"},
             "quota": {"quota_type", "company_name"},
             "contract": {"company_name"},
             "lifecycle": set(DEFAULT_MAPPINGS["lifecycle"]),
@@ -138,16 +175,47 @@ class ExcelImportService:
     def _import_person(self, connection, row, columns):
         name = self._text(self._value(row, columns, "name"))
         gender = self._text(self._value(row, columns, "gender"))
-        if not name or gender not in {"男", "女"}:
-            raise ValueError("姓名必填，性别必须为男或女")
+        if not name or gender not in {None, "男", "女"}:
+            raise ValueError("劳工姓名必填；性别如填写必须为男或女")
         company = self._text(self._value(row, columns, "company_name"))
         introducer = self._text(self._value(row, columns, "introducer"))
-        id_last4 = self._last4(self._value(row, columns, "id_last4"))
-        permit_last4 = self._last4(self._value(row, columns, "permit_last4"))
-        if self.repository.person_duplicate(connection, name, gender, company, id_last4, permit_last4):
+        worker_type_raw = self._text(self._value(row, columns, "worker_type")) or "new"
+        worker_type = {"新人": "new", "续约": "renewal", "new": "new", "renewal": "renewal"}.get(worker_type_raw)
+        if not worker_type:
+            raise ValueError("人员类型必须为新人或续约")
+        mainland_first4 = self._digits(self._value(row, columns, "mainland_id_first4"), 4, "身份证前四位")
+        mainland_last4 = self._digits(self._value(row, columns, "mainland_id_last4"), 4, "身份证后四位")
+        permit_first4 = self._digits(self._value(row, columns, "hkmo_permit_first4"), 4, "通行证前四位")
+        permit_last6 = self._digits(self._value(row, columns, "hkmo_permit_last6"), 6, "通行证后六位")
+        legacy_permit_last4 = permit_last6[-4:] if permit_last6 else self._last4(self._value(row, columns, "permit_last4"))
+        birth_date = self._date(self._value(row, columns, "birth_date"))
+        birth_year_month = self._text(self._value(row, columns, "birth_year_month"))
+        if birth_year_month and len(birth_year_month) >= 7:
+            birth_year_month = birth_year_month[:7]
+        if self.repository.person_duplicate(
+            connection, name, gender, company, mainland_last4, legacy_permit_last4
+        ):
             return "skipped"
-        self.repository.insert_person(
-            connection, (name, gender, company, introducer, id_last4, permit_last4)
+        cursor = connection.execute(
+            """INSERT INTO people
+               (name,person_name,gender,company_name,introducer,id_last4,permit_last4,
+                worker_type,birth_date,birth_year_month,mainland_id_first4,
+                mainland_id_last4,hkmo_permit_first4,hkmo_permit_last6,
+                entry_permit_no,hk_submission_date,visa_status_date,visa_status,remarks)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            (name, name, gender, company, introducer, mainland_last4, legacy_permit_last4,
+             worker_type, birth_date, birth_year_month, mainland_first4, mainland_last4,
+             permit_first4, permit_last6,
+             self._text(self._value(row, columns, "entry_permit_no")),
+             self._date(self._value(row, columns, "hk_submission_date")),
+             self._date(self._value(row, columns, "visa_status_date")),
+             self._text(self._value(row, columns, "visa_status")),
+             self._text(self._value(row, columns, "remarks"))),
+        )
+        connection.execute(
+            """INSERT INTO events(person_id,event_type,note,created_at)
+               VALUES (?,'登记','生产版Excel导入',datetime('now','localtime'))""",
+            (cursor.lastrowid,),
         )
         return "success"
 
