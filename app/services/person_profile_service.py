@@ -61,9 +61,12 @@ def check_hk_id_appointment_ready(person):
 def get_missing_documents(person, available_document_types):
     available = set(available_document_types)
     missing = [DOCUMENT_TYPES[item] for item in BASE_REQUIRED_DOCUMENTS if item not in available]
+    if not (_value(person, "mainland_id_first4") or _value(person, "mainland_id_last4") or _value(person, "id_last4")):
+        missing.append("身份证号码缺失")
     visa_query = get_entry_visa_query_key(person)
     if not visa_query["complete"]:
-        missing.append(visa_query["label"])
+        if visa_query["label"] != "国内身份证前四位" or "身份证号码缺失" not in missing:
+            missing.append(visa_query["label"])
     appointment = check_hk_id_appointment_ready(person)
     missing.extend(item for item in appointment["missing"] if item not in missing)
     return missing
@@ -166,6 +169,7 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
         return None
     person = dict(person_row)
     person["worker_type"] = person.get("worker_type") or "new"
+    person["visa_status"] = person.get("visa_status") or "未出"
     person["worker_type_label"] = "续约" if person["worker_type"] == "renewal" else "新人"
     person["display_entry_permit_no"] = (
         person.get("entry_permit_no") or "—"

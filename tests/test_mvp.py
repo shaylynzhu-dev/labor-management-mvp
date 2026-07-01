@@ -354,6 +354,64 @@ class LabourOSMVPTest(unittest.TestCase):
         self.assertEqual(set(response.get_json()), {"code", "message", "data"})
         self.assertEqual(response.get_json()["code"], 413)
 
+    def test_person_import_new_field_rules_and_legacy_compatibility(self):
+        import pandas as pd
+        from openpyxl import load_workbook
+
+        with self.client.session_transaction() as session_data:
+            session_data["role"] = "admin"
+            session_data["user_id"] = 1
+
+        template = self.client.get("/imports/template/person")
+        workbook = load_workbook(io.BytesIO(template.data), read_only=True)
+        headers = [cell.value for cell in next(workbook.active.iter_rows())]
+        self.assertIn("身份证号码", headers)
+        self.assertNotIn("出生年月", headers)
+        self.assertNotIn("身份证前四位", headers)
+        self.assertNotIn("身份证后四位", headers)
+
+        new_file = io.BytesIO()
+        pd.DataFrame([{
+            "公司名称": "新规则公司", "劳工姓名": "新规则人员", "人员类型": "新人",
+            "入境签证号码": "ENTRY-100", "出生日期": "1982/7/21",
+            "身份证号码": "44010119820721123X", "通行证前四位": "CJ52",
+            "通行证后六位": "123456", "HK入表日期": "2026/7/1",
+            "VISA状态": "处理中",
+        }]).to_excel(new_file, index=False, engine="openpyxl")
+        new_file.seek(0)
+        response = self.client.post(
+            "/imports/person?format=json",
+            data={"file": (new_file, "new-person.xlsx")},
+            content_type="multipart/form-data",
+        )
+        self.assertEqual(response.status_code, 200)
+        self.assertEqual(response.get_json()["data"]["success"], 1)
+        person = self.db_row("SELECT * FROM people WHERE name='新规则人员'")
+        self.assertEqual(person["birth_year_month"], "1982-07")
+        self.assertEqual(person["mainland_id_first4"], "4401")
+        self.assertEqual(person["mainland_id_last4"], "123X")
+        self.assertEqual(person["hkmo_permit_first4"], "CJ52")
+        self.assertEqual(person["visa_status"], "未出")
+
+        invalid_file = io.BytesIO()
+        pd.DataFrame([
+            {"劳工姓名": "", "通行证前四位": "CJ52"},
+            {"劳工姓名": "错误前缀", "通行证前四位": "C12"},
+            {"劳工姓名": "错误后缀", "通行证后六位": "ABC123"},
+            {"劳工姓名": "错误状态", "VISA状态": "未知"},
+        ]).to_excel(invalid_file, index=False, engine="openpyxl")
+        invalid_file.seek(0)
+        invalid = self.client.post(
+            "/imports/person?format=json",
+            data={"file": (invalid_file, "invalid-person.xlsx")},
+            content_type="multipart/form-data",
+        ).get_json()["data"]
+        messages = [item["message"] for item in invalid["errors"]]
+        self.assertIn("缺少劳工姓名", messages)
+        self.assertIn("通行证前四位必须为4位字符", messages)
+        self.assertIn("通行证后六位必须为6位数字", messages)
+        self.assertIn("VISA状态只能是：未出、待缴费、已出", messages)
+
     def test_add_incomplete_quota_and_supplement_later(self):
         page = self.client.get("/").get_data(as_text=True)
         quota_form = page.split('<dialog id="quota-modal">', 1)[1].split("</dialog>", 1)[0]

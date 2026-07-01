@@ -1166,7 +1166,13 @@ def init_db():
     db.execute(
         """UPDATE people SET person_name=COALESCE(NULLIF(person_name,''),name),
                   worker_type=CASE WHEN worker_type IN ('new','renewal') THEN worker_type ELSE 'new' END,
-                  mainland_id_last4=COALESCE(mainland_id_last4,id_last4)
+                  mainland_id_last4=COALESCE(mainland_id_last4,id_last4),
+                  birth_year_month=COALESCE(birth_year_month,substr(birth_date,1,7)),
+                  visa_status=CASE visa_status
+                    WHEN '未提交' THEN '未出' WHEN '处理中' THEN '未出'
+                    WHEN '待补资料' THEN '待缴费'
+                    WHEN '未出' THEN '未出' WHEN '待缴费' THEN '待缴费'
+                    WHEN '已出' THEN '已出' ELSE NULL END
            """
     )
 
@@ -1975,6 +1981,9 @@ def index(default_view="overview"):
     document_keyword = request.args.get("doc_q", "").strip()
     document_upload_result = session.pop("person_document_upload_result", None)
     selected_status = request.args.get("status", "").strip()
+    selected_visa_status = request.args.get("visa_status", "").strip()
+    if selected_visa_status not in {"未出", "待缴费", "已出"}:
+        selected_visa_status = ""
     import_result = None
     import_log_id = request.args.get("import_log", "").strip()
     if import_log_id.isdigit():
@@ -2027,9 +2036,10 @@ def index(default_view="overview"):
           OR p.permit_last4 LIKE ? OR COALESCE(q.quota_number, '') LIKE ?
           OR EXISTS (SELECT 1 FROM person_documents pd WHERE pd.person_id=p.id
                      AND pd.is_deleted=0 AND (pd.original_filename LIKE ? OR pd.ocr_text LIKE ?)))
+          AND (?='' OR COALESCE(p.visa_status,'未出')=?)
         ORDER BY p.id DESC
         """,
-        (keyword, *([like] * 14)),
+        (keyword, *([like] * 14), selected_visa_status, selected_visa_status),
     ).fetchall()
 
     quota_rows = db.execute(
@@ -2478,6 +2488,7 @@ def index(default_view="overview"):
         available_people=available_people,
         keyword=keyword,
         selected_status=selected_status,
+        selected_visa_status=selected_visa_status,
         contract_statuses=CONTRACT_STATUSES,
         quota_types=QUOTA_TYPES,
         expiry_checks=EXPIRY_CHECKS,
@@ -2528,15 +2539,25 @@ def update_person_profile(person_id):
         "hk_id_appointment_status", "remarks",
     )
     values = [(request.form.get(field) or "").strip() or None for field in fields]
-    fragments = {
+    if values[1] and not values[2]:
+        values[2] = values[1][:7]
+    if values[5]:
+        values[5] = values[5].upper()
+    digit_fragments = {
         "身份证前四位": values[3], "身份证后四位": values[4],
-        "通行证前四位": values[5], "通行证后六位": values[6],
+        "通行证后六位": values[6],
     }
-    expected_lengths = {"身份证前四位": 4, "身份证后四位": 4, "通行证前四位": 4, "通行证后六位": 6}
-    for label, value in fragments.items():
+    expected_lengths = {"身份证前四位": 4, "身份证后四位": 4, "通行证后六位": 6}
+    for label, value in digit_fragments.items():
         if value and (not value.isdigit() or len(value) != expected_lengths[label]):
             flash(f"{label}必须为{expected_lengths[label]}位数字。", "error")
             return redirect(url_for("person_detail", person_id=person_id))
+    if values[5] and len(values[5]) != 4:
+        flash("通行证前四位必须为4位字符。", "error")
+        return redirect(url_for("person_detail", person_id=person_id))
+    if values[10] and values[10] not in {"未出", "待缴费", "已出"}:
+        flash("VISA状态只能是：未出、待缴费、已出。", "error")
+        return redirect(url_for("person_detail", person_id=person_id))
     if values[2] and not re.fullmatch(r"\d{4}-\d{2}", values[2]):
         flash("出生年月格式必须为 YYYY-MM。", "error")
         return redirect(url_for("person_detail", person_id=person_id))

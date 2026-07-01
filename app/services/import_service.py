@@ -11,18 +11,13 @@ from app.services.dispatch_engine import (
 
 DEFAULT_MAPPINGS = {
     "person": {
-        "name": "劳工姓名", "gender": "性别", "company_name": "公司名称",
-        "introducer": "介绍人", "id_last4": "身份证后四位",
-        "permit_last4": "港澳通行证后四位",
+        "company_name": "公司名称", "name": "劳工姓名",
         "worker_type": "人员类型", "entry_permit_no": "入境签证号码",
-        "birth_date": "出生日期", "birth_year_month": "出生年月",
-        "mainland_id_first4": "身份证前四位",
-        "mainland_id_last4": "身份证后四位",
+        "birth_date": "出生日期", "mainland_id_number": "身份证号码",
         "hkmo_permit_first4": "通行证前四位",
         "hkmo_permit_last6": "通行证后六位",
         "hk_submission_date": "HK入表日期",
-        "visa_status_date": "出VISA情况日期", "visa_status": "VISA状态",
-        "remarks": "备注",
+        "visa_status": "VISA状态",
     },
     "quota": {
         "quota_type": "配额类型", "company_name": "公司名",
@@ -48,6 +43,7 @@ PERSON_COLUMN_ALIASES = {
     "company_name": ("公司名称", "公司名"),
     "worker_type": ("人员类型",), "entry_permit_no": ("入境签证号码", "入境编号"),
     "birth_date": ("出生日期",), "birth_year_month": ("出生年月",),
+    "mainland_id_number": ("身份证号码",),
     "mainland_id_first4": ("身份证前四位",), "mainland_id_last4": ("身份证后四位",),
     "hkmo_permit_first4": ("通行证前四位", "港澳通行证前四位"),
     "hkmo_permit_last6": ("通行证后六位", "港澳通行证后六位"),
@@ -106,6 +102,15 @@ class ExcelImportService:
         if not text.isdigit() or len(text) != length:
             raise ValueError(f"{label}必须为{length}位数字")
         return text
+
+    @staticmethod
+    def _characters(value, length, label):
+        text = ExcelImportService._text(value)
+        if text is None:
+            return None
+        if len(text) != length:
+            raise ValueError(f"{label}必须为{length}位字符")
+        return text.upper()
 
     def _frame(self, kind, uploaded, mapping):
         pd = _pandas()
@@ -175,23 +180,39 @@ class ExcelImportService:
     def _import_person(self, connection, row, columns):
         name = self._text(self._value(row, columns, "name"))
         gender = self._text(self._value(row, columns, "gender"))
-        if not name or gender not in {None, "男", "女"}:
-            raise ValueError("劳工姓名必填；性别如填写必须为男或女")
+        if not name:
+            raise ValueError("缺少劳工姓名")
+        if gender not in {None, "男", "女"}:
+            raise ValueError("性别如填写必须为男或女")
         company = self._text(self._value(row, columns, "company_name"))
         introducer = self._text(self._value(row, columns, "introducer"))
         worker_type_raw = self._text(self._value(row, columns, "worker_type")) or "new"
         worker_type = {"新人": "new", "续约": "renewal", "new": "new", "renewal": "renewal"}.get(worker_type_raw)
         if not worker_type:
             raise ValueError("人员类型必须为新人或续约")
-        mainland_first4 = self._digits(self._value(row, columns, "mainland_id_first4"), 4, "身份证前四位")
-        mainland_last4 = self._digits(self._value(row, columns, "mainland_id_last4"), 4, "身份证后四位")
-        permit_first4 = self._digits(self._value(row, columns, "hkmo_permit_first4"), 4, "通行证前四位")
+        mainland_number = self._text(self._value(row, columns, "mainland_id_number"))
+        mainland_number = mainland_number.replace(" ", "").upper() if mainland_number else None
+        mainland_first4 = mainland_number[:4] if mainland_number and len(mainland_number) >= 4 else None
+        mainland_last4 = mainland_number[-4:] if mainland_number and len(mainland_number) >= 4 else None
+        if not mainland_number:
+            mainland_first4 = self._digits(self._value(row, columns, "mainland_id_first4"), 4, "身份证前四位")
+            mainland_last4 = self._digits(self._value(row, columns, "mainland_id_last4"), 4, "身份证后四位")
+        permit_first4 = self._characters(self._value(row, columns, "hkmo_permit_first4"), 4, "通行证前四位")
         permit_last6 = self._digits(self._value(row, columns, "hkmo_permit_last6"), 6, "通行证后六位")
         legacy_permit_last4 = permit_last6[-4:] if permit_last6 else self._last4(self._value(row, columns, "permit_last4"))
         birth_date = self._date(self._value(row, columns, "birth_date"))
-        birth_year_month = self._text(self._value(row, columns, "birth_year_month"))
+        birth_year_month = birth_date[:7] if birth_date else self._text(
+            self._value(row, columns, "birth_year_month")
+        )
         if birth_year_month and len(birth_year_month) >= 7:
             birth_year_month = birth_year_month[:7]
+        visa_status_raw = self._text(self._value(row, columns, "visa_status"))
+        visa_status = {
+            None: None, "未出": "未出", "未提交": "未出", "处理中": "未出",
+            "待缴费": "待缴费", "待补资料": "待缴费", "已出": "已出",
+        }.get(visa_status_raw)
+        if visa_status_raw is not None and visa_status is None:
+            raise ValueError("VISA状态只能是：未出、待缴费、已出")
         if self.repository.person_duplicate(
             connection, name, gender, company, mainland_last4, legacy_permit_last4
         ):
@@ -209,7 +230,7 @@ class ExcelImportService:
              self._text(self._value(row, columns, "entry_permit_no")),
              self._date(self._value(row, columns, "hk_submission_date")),
              self._date(self._value(row, columns, "visa_status_date")),
-             self._text(self._value(row, columns, "visa_status")),
+             visa_status,
              self._text(self._value(row, columns, "remarks"))),
         )
         connection.execute(
