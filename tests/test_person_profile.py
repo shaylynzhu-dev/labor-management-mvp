@@ -1,11 +1,12 @@
 import tempfile
 import unittest
+import io
 from pathlib import Path
 
 from app import app, get_db, init_db
 from app.services.person_profile_service import (
     check_hk_id_appointment_ready, get_entry_visa_query_key,
-    get_missing_documents, get_person_profile,
+    get_missing_documents, get_person_profile, suggest_person_by_filename,
 )
 
 
@@ -33,6 +34,10 @@ class PersonProfileTest(unittest.TestCase):
             self.assertIsNotNone(db.execute(
                 "SELECT name FROM sqlite_master WHERE type='table' AND name='person_documents'"
             ).fetchone())
+            document_columns = {
+                row["name"] for row in db.execute("PRAGMA table_info(person_documents)")
+            }
+            self.assertTrue({"mime_type", "file_size", "upload_batch_id"}.issubset(document_columns))
 
             person = {
                 "worker_type": "new", "mainland_id_first4": "1234",
@@ -44,6 +49,10 @@ class PersonProfileTest(unittest.TestCase):
             self.assertEqual(get_missing_documents(
                 person, {"resume", "contract", "mainland_id", "hkmo_permit"}
             ), [])
+            db.execute("INSERT INTO people(name,person_name,gender) VALUES ('陈小明','陈小明','男')")
+            db.commit()
+            suggestions = suggest_person_by_filename(db, "陈小明_合同.pdf")
+            self.assertEqual([item["name"] for item in suggestions], ["陈小明"])
 
     def test_profile_masks_entry_permit_for_non_admin(self):
         with app.app_context():
@@ -62,6 +71,52 @@ class PersonProfileTest(unittest.TestCase):
             page = app.test_client().get(f"/people/{person_id}")
             self.assertEqual(page.status_code, 200)
             self.assertIn("入境签证查询", page.get_data(as_text=True))
+
+    def test_folder_upload_binding_and_soft_delete_keeps_file(self):
+        with app.app_context():
+            db = get_db()
+            person_id = db.execute(
+                "INSERT INTO people(name,person_name,gender,worker_type) VALUES ('多文件人员','多文件人员','男','new')"
+            ).lastrowid
+            db.commit()
+        client = app.test_client()
+        response = client.post(
+            "/person-documents/upload-batch",
+            data={
+                "person_id": str(person_id), "document_type": "resume",
+                "return_to": "person",
+                "files": [
+                    (io.BytesIO(b"pdf-one"), "多文件人员_简历.pdf"),
+                    (io.BytesIO(b"image-two"), "多文件人员_证件.jpg"),
+                ],
+            },
+            content_type="multipart/form-data",
+            follow_redirects=True,
+        )
+        html = response.get_data(as_text=True)
+        self.assertEqual(response.status_code, 200)
+        self.assertIn("成功 2", html)
+        self.assertNotIn("{{", html)
+        with app.app_context():
+            documents = get_db().execute(
+                "SELECT * FROM person_documents WHERE person_id=? ORDER BY id", (person_id,)
+            ).fetchall()
+            self.assertEqual(len(documents), 2)
+            stored_file = Path(app.config["UPLOAD_FOLDER"]) / documents[0]["stored_path"]
+            self.assertTrue(stored_file.is_file())
+            document_id = documents[0]["id"]
+        deleted = client.delete(f"/api/person_documents/{document_id}")
+        self.assertEqual(deleted.status_code, 200)
+        self.assertTrue(stored_file.is_file())
+        with app.app_context():
+            row = get_db().execute(
+                "SELECT is_deleted,status FROM person_documents WHERE id=?", (document_id,)
+            ).fetchone()
+            self.assertEqual((row["is_deleted"], row["status"]), (1, "deleted"))
+
+        library = client.get("/?view=documents")
+        self.assertEqual(library.status_code, 200)
+        self.assertNotIn("{{", library.get_data(as_text=True))
 
 
 if __name__ == "__main__":

@@ -1,4 +1,9 @@
 from datetime import date
+from pathlib import Path
+import mimetypes
+import uuid
+
+from werkzeug.utils import secure_filename
 
 
 DOCUMENT_TYPES = {
@@ -14,6 +19,7 @@ DOCUMENT_TYPES = {
     "hk_id_appointment": "香港身份证预约资料",
     "work_proof": "工作证明",
     "other": "其他",
+    "unknown": "未分类",
 }
 
 BASE_REQUIRED_DOCUMENTS = ("resume", "contract", "mainland_id", "hkmo_permit")
@@ -63,6 +69,86 @@ def get_missing_documents(person, available_document_types):
     return missing
 
 
+def suggest_person_by_filename(db, filename):
+    filename = (filename or "").casefold()
+    if not filename:
+        return []
+    candidates = []
+    for row in db.execute(
+        "SELECT id,name,company_name FROM people WHERE is_deleted=0 ORDER BY length(name) DESC,id"
+    ).fetchall():
+        if row["name"] and row["name"].casefold() in filename:
+            candidates.append(dict(row))
+    return candidates
+
+
+def save_person_document_batch(db, upload_root, person_id, files, document_type, remarks=None):
+    files = [item for item in files if item and item.filename]
+    if not files:
+        raise ValueError("请选择至少一个文件")
+    if len(files) > 50:
+        raise ValueError("单次最多上传50个文件")
+    if document_type not in DOCUMENT_TYPES:
+        document_type = "unknown"
+    if not db.execute(
+        "SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)
+    ).fetchone():
+        raise ValueError("绑定人员不存在")
+
+    allowed = {"pdf", "jpg", "jpeg", "png", "doc", "docx"}
+    max_size = 25 * 1024 * 1024
+    batch_id = uuid.uuid4().hex
+    batch_dir = Path(upload_root) / "person_documents" / str(person_id) / batch_id
+    batch_dir.mkdir(parents=True, exist_ok=True)
+    result = {"batch_id": batch_id, "success": 0, "skipped": 0, "failed": 0, "errors": []}
+    used_names = set()
+
+    for uploaded in files:
+        original = Path(uploaded.filename).name
+        extension = original.rsplit(".", 1)[-1].lower() if "." in original else ""
+        if extension not in allowed:
+            result["skipped"] += 1
+            result["errors"].append({"filename": original, "reason": "不支持的文件格式"})
+            continue
+        safe_name = secure_filename(original) or f"document.{extension}"
+        stem, suffix = Path(safe_name).stem, Path(safe_name).suffix
+        counter = 1
+        while safe_name.casefold() in used_names or (batch_dir / safe_name).exists():
+            safe_name = f"{stem}_{counter}{suffix}"
+            counter += 1
+        used_names.add(safe_name.casefold())
+        destination = batch_dir / safe_name
+        size = 0
+        try:
+            with destination.open("wb") as output:
+                while True:
+                    chunk = uploaded.stream.read(1024 * 1024)
+                    if not chunk:
+                        break
+                    size += len(chunk)
+                    if size > max_size:
+                        raise ValueError("单文件超过25MB")
+                    output.write(chunk)
+            relative_path = destination.relative_to(Path(upload_root)).as_posix()
+            db.execute(
+                """INSERT INTO person_documents
+                   (person_id,document_type,original_filename,stored_path,mime_type,
+                    file_size,upload_batch_id,status,remarks)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                (person_id, document_type, original, relative_path,
+                 uploaded.mimetype or mimetypes.guess_type(original)[0] or "application/octet-stream",
+                 size, batch_id, "active", remarks),
+            )
+            result["success"] += 1
+        except Exception as error:
+            if destination.exists():
+                destination.unlink()
+            result["failed"] += 1
+            result["errors"].append({"filename": original, "reason": str(error)})
+    db.commit()
+    return result
+
+
 def _mask(value, visible_start=2, visible_end=2):
     if not value:
         return "—"
@@ -101,6 +187,12 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
     for document in documents:
         document["document_type_label"] = DOCUMENT_TYPES.get(document["document_type"], "其他")
         document["is_expired"] = bool(document.get("expiry_date") and document["expiry_date"] < today)
+        document["file_size_label"] = _file_size_label(document.get("file_size"))
+    document_groups = []
+    for document_type, label in DOCUMENT_TYPES.items():
+        items = [item for item in documents if item["document_type"] == document_type]
+        if items:
+            document_groups.append({"type": document_type, "label": label, "items": items})
     document_types = {item["document_type"] for item in documents}
     visa_query = get_entry_visa_query_key(person)
     appointment = check_hk_id_appointment_ready(person)
@@ -110,6 +202,7 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
     return {
         "person": person,
         "documents": documents,
+        "document_groups": document_groups,
         "contracts": db.execute(
             "SELECT * FROM contracts WHERE person_id=? AND is_deleted=0 ORDER BY created_at DESC",
             (person_id,),
@@ -128,3 +221,12 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
         "completeness": max(0, completeness),
         "document_types": DOCUMENT_TYPES,
     }
+
+
+def _file_size_label(value):
+    size = int(value or 0)
+    if size >= 1024 * 1024:
+        return f"{size / (1024 * 1024):.1f} MB"
+    if size >= 1024:
+        return f"{size / 1024:.1f} KB"
+    return f"{size} B"

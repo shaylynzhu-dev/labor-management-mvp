@@ -24,7 +24,10 @@ from app.services.dispatch_engine import (
     normalize_contract_status, quota_replacement_limit, register_worker_entry,
     transition_contract, trigger_worker_departure,
 )
-from app.services.person_profile_service import DOCUMENT_TYPES, get_person_profile
+from app.services.person_profile_service import (
+    DOCUMENT_TYPES, get_person_profile, save_person_document_batch,
+    suggest_person_by_filename,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -45,7 +48,7 @@ app.config.update(
     SECRET_KEY=os.environ.get("LABOUR_OS_SECRET_KEY", "change-this-in-production"),
     DATABASE=DATABASE,
     UPLOAD_FOLDER=UPLOAD_DIR,
-    MAX_CONTENT_LENGTH=16 * 1024 * 1024,
+    MAX_CONTENT_LENGTH=1300 * 1024 * 1024,
     TEMPLATES_AUTO_RELOAD=True,
     SEND_FILE_MAX_AGE_DEFAULT=0,
 )
@@ -964,6 +967,9 @@ def init_db():
             document_type TEXT NOT NULL DEFAULT 'other',
             original_filename TEXT NOT NULL,
             stored_path TEXT NOT NULL,
+            mime_type TEXT,
+            file_size INTEGER NOT NULL DEFAULT 0,
+            upload_batch_id TEXT,
             ocr_text TEXT NOT NULL DEFAULT '',
             issue_date TEXT,
             expiry_date TEXT,
@@ -1148,6 +1154,16 @@ def init_db():
     for column, definition in profile_columns.items():
         if column not in current_person_columns:
             db.execute(f"ALTER TABLE people ADD COLUMN {column} {definition}")
+
+    person_document_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(person_documents)").fetchall()
+    }
+    for column, definition in {
+        "mime_type": "TEXT", "file_size": "INTEGER NOT NULL DEFAULT 0",
+        "upload_batch_id": "TEXT",
+    }.items():
+        if column not in person_document_columns:
+            db.execute(f"ALTER TABLE person_documents ADD COLUMN {column} {definition}")
     db.execute(
         """UPDATE people SET person_name=COALESCE(NULLIF(person_name,''),name),
                   worker_type=CASE WHEN worker_type IN ('new','renewal') THEN worker_type ELSE 'new' END,
@@ -1958,6 +1974,7 @@ def index(default_view="overview"):
         active_view = "overview"
     keyword = request.args.get("q", "").strip()
     document_keyword = request.args.get("doc_q", "").strip()
+    document_upload_result = session.pop("person_document_upload_result", None)
     selected_status = request.args.get("status", "").strip()
     import_result = None
     import_log_id = request.args.get("import_log", "").strip()
@@ -2468,6 +2485,7 @@ def index(default_view="overview"):
         task_statuses=TASK_STATUSES,
         active_view=active_view,
         document_keyword=document_keyword,
+        document_upload_result=document_upload_result,
         import_result=import_result,
         today=date.today().isoformat(),
     )
@@ -2485,7 +2503,10 @@ def person_detail(person_id):
     )
     if profile is None:
         abort(404)
-    return render_template("person_detail.html", **profile)
+    return render_template(
+        "person_detail.html", **profile,
+        document_upload_result=session.pop("person_document_upload_result", None),
+    )
 
 
 @app.post("/people/<int:person_id>/profile")
@@ -3670,6 +3691,41 @@ def view_person_document(document_id):
     )
 
 
+@app.get("/api/person-documents/suggest")
+def suggest_person_document_owner():
+    filename = request.args.get("filename", "")[:255]
+    return api_response(0, "ok", suggest_person_by_filename(get_db(), filename))
+
+
+@app.post("/person-documents/upload-batch")
+def upload_person_document_batch():
+    person_id = request.form.get("person_id", "").strip()
+    return_to = request.form.get("return_to", "library")
+    try:
+        person_id_value = int(person_id)
+        result = save_person_document_batch(
+            get_db(), app.config["UPLOAD_FOLDER"], person_id_value,
+            request.files.getlist("files"),
+            request.form.get("document_type", "unknown"),
+            (request.form.get("remarks") or "").strip() or None,
+        )
+        session["person_document_upload_result"] = result
+        flash(
+            f"批次上传完成：成功 {result['success']}，跳过 {result['skipped']}，失败 {result['failed']}。",
+            "success" if result["failed"] == 0 else "error",
+        )
+    except (TypeError, ValueError) as error:
+        session["person_document_upload_result"] = {
+            "success": 0, "skipped": 0, "failed": 1,
+            "errors": [{"filename": "—", "reason": str(error)}],
+        }
+        flash(str(error), "error")
+        person_id_value = int(person_id) if person_id.isdigit() else None
+    if return_to == "person" and person_id_value:
+        return redirect(url_for("person_detail", person_id=person_id_value))
+    return redirect(url_for("index", view="documents"))
+
+
 @app.get("/documents/<int:document_id>/download")
 def download_document(document_id):
     document = get_db().execute(
@@ -3733,6 +3789,10 @@ def soft_delete_resource(resource, resource_id):
                 WHERE {primary_key}=? AND is_deleted=0""",
             (session.get("user_id"), value),
         )
+        if canonical == "person_documents":
+            db.execute(
+                "UPDATE person_documents SET status='deleted' WHERE id=?", (value,)
+            )
         if cursor.rowcount == 0:
             db.rollback()
             return api_response(404, "记录不存在或已经删除", None, 404)
@@ -3777,6 +3837,8 @@ def restore_resource(resource, resource_id):
     if cursor.rowcount == 0:
         db.rollback()
         return api_response(404, "回收站中没有该记录", None, 404)
+    if canonical == "person_documents":
+        db.execute("UPDATE person_documents SET status='active' WHERE id=?", (value,))
     if mirror_table:
         db.execute(
             f"""UPDATE {mirror_table}

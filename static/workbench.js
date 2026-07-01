@@ -128,4 +128,39 @@
       documentSuggestion.hidden = true;
     }
   });
+
+  document.querySelectorAll('[data-batch-upload]').forEach((form) => {
+    const inputs = Array.from(form.querySelectorAll('input[type="file"][name="files"]'));
+    const countLabel = form.querySelector('[data-upload-file-count]');
+    const personSelect = form.querySelector('[data-batch-person]');
+    const suggestion = form.querySelector('[data-batch-suggestion]');
+    const files = () => inputs.flatMap((input) => Array.from(input.files || []));
+    const refresh = () => {
+      const selected = files();
+      if (countLabel) countLabel.textContent = selected.length ? `已选择 ${selected.length} 个文件` : '尚未选择文件';
+      if (!personSelect || !suggestion) return;
+      const options = Array.from(personSelect.options).filter((option) => option.dataset.personName);
+      const matches = options.filter((option) => selected.some((file) => file.name.includes(option.dataset.personName)));
+      if (matches.length === 1) {
+        personSelect.value = matches[0].value;
+        suggestion.textContent = `已按文件名推荐：${matches[0].dataset.personName}`;
+        suggestion.hidden = false;
+      } else if (matches.length > 1) {
+        personSelect.value = '';
+        suggestion.textContent = `匹配到多个候选：${matches.map((item) => item.dataset.personName).join('、')}，请人工选择。`;
+        suggestion.hidden = false;
+      } else {
+        suggestion.hidden = true;
+      }
+    };
+    inputs.forEach((input) => input.addEventListener('change', refresh));
+    form.addEventListener('submit', (event) => {
+      const selected = files();
+      const oversized = selected.find((file) => file.size > 25 * 1024 * 1024);
+      if (!selected.length || selected.length > 50 || oversized) {
+        event.preventDefault();
+        window.alert(!selected.length ? '请至少选择一个文件。' : selected.length > 50 ? '单次最多上传50个文件。' : `${oversized.name} 超过25MB。`);
+      }
+    });
+  });
 })();
