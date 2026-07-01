@@ -155,24 +155,26 @@ refreshBusinessStatus();
 window.setInterval(refreshBusinessStatus, 30000);
 
 const pushTray = document.getElementById('push-tray');
-if (pushTray && window.EventSource) {
-  const reminderStream = new EventSource('/stream/reminders');
-  reminderStream.addEventListener('open', () => {
-    document.querySelectorAll('.push-status').forEach((node) => { node.textContent = 'Push 已连接'; });
-  });
-  reminderStream.addEventListener('error', () => {
-    document.querySelectorAll('.push-status').forEach((node) => { node.textContent = 'Push 重连中'; });
-  });
-  reminderStream.addEventListener('reminders', (event) => {
-    const reminders = JSON.parse(event.data || '[]');
+if (pushTray) {
+  let lastNotificationKey = null;
+  async function refreshReminders() {
+    try {
+      const reminders = await apiFetch('/stream/reminders');
+      document.querySelectorAll('.push-status').forEach((node) => { node.textContent = '提醒已更新'; });
     pushTray.innerHTML = reminders.slice(0, 3).map((item) => `
       <a class="push-message push-${escapeHtml(item.level)}" href="${escapeHtml(item.url)}">
         <span>${escapeHtml(item.level)}</span>
         <div><strong>${escapeHtml(item.title)}</strong><small>${escapeHtml(item.message)}</small></div>
       </a>`).join('');
-    if (reminders.length && window.Notification?.permission === 'granted') {
+      if (reminders.length && reminders[0].key !== lastNotificationKey && window.Notification?.permission === 'granted') {
       const item = reminders[0];
       new Notification(item.title, {body: item.message, tag: item.key});
+        lastNotificationKey = item.key;
+      }
+    } catch (_error) {
+      document.querySelectorAll('.push-status').forEach((node) => { node.textContent = '提醒稍后重试'; });
     }
-  });
+  }
+  refreshReminders();
+  window.setInterval(refreshReminders, 30000);
 }

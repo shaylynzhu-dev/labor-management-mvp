@@ -8,12 +8,11 @@ import re
 import shutil
 import sqlite3
 import subprocess
-import time
 import uuid
 
 from flask import (
-    Flask, Response, abort, flash, g, jsonify, redirect, render_template, request, session,
-    send_from_directory, stream_with_context, url_for,
+    Flask, abort, flash, g, jsonify, redirect, render_template, request, session,
+    send_from_directory, url_for,
 )
 from werkzeug.utils import secure_filename
 
@@ -2844,23 +2843,10 @@ def dashboard_status():
 
 @app.get("/stream/reminders")
 def reminder_stream():
-    @stream_with_context
-    def generate():
-        previous = None
-        while True:
-            reminders = collect_push_reminders()
-            signature = json.dumps(reminders, ensure_ascii=False, sort_keys=True)
-            if signature != previous:
-                yield f"event: reminders\ndata: {json.dumps(reminders, ensure_ascii=False)}\n\n"
-                previous = signature
-            else:
-                yield ": heartbeat\n\n"
-            time.sleep(15)
-
-    return Response(
-        generate(), mimetype="text/event-stream",
-        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"},
-    )
+    """Compatibility endpoint: one fast response, never a long-lived worker."""
+    response, status = api_response(0, "ok", collect_push_reminders())
+    response.headers["Cache-Control"] = "no-store"
+    return response, status
 
 
 @app.get("/api/reminders")
@@ -2871,7 +2857,7 @@ def reminders_api():
 @app.get("/api/reminders/stream")
 def legacy_reminder_stream_api():
     return api_response(
-        0, "SSE endpoint moved to /stream/reminders", collect_push_reminders()
+        0, "Reminder stream now uses short polling", collect_push_reminders()
     )
 
 

@@ -126,6 +126,9 @@ def create_app(config_object=None):
 
     @app.before_request
     def require_login():
+        if request.path in {"/upload/person_excel", "/upload/quota_excel"} or request.path.startswith("/imports/"):
+            if request.content_length and request.content_length > 16 * 1024 * 1024:
+                return api_response(413, "Excel upload is too large", None, 413)
         if app.config.get("TESTING"):
             return None
         if request.endpoint in {"auth.login", "static", "health"}:

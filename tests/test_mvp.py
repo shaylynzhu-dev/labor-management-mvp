@@ -336,10 +336,13 @@ class LabourOSMVPTest(unittest.TestCase):
         self.assertFalse(app.debug)
         self.assertTrue((Path(app.config["LOG_DIR"]) / "application.log").is_file())
 
-        for endpoint in ("/health", "/api/dashboard/status", "/api/reminders"):
+        for endpoint in ("/health", "/api/dashboard/status", "/api/reminders", "/stream/reminders"):
             response = self.client.get(endpoint)
             self.assertEqual(response.status_code, 200)
             self.assertEqual(set(response.get_json()), {"code", "message", "data"})
+            if endpoint == "/stream/reminders":
+                self.assertTrue(response.is_json)
+                self.assertNotEqual(response.mimetype, "text/event-stream")
 
         oversized = io.BytesIO(b"x" * (17 * 1024 * 1024))
         response = self.client.post(
