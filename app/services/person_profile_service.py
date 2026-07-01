@@ -1,6 +1,7 @@
 from datetime import date
 from pathlib import Path
 import mimetypes
+import re
 import uuid
 
 from werkzeug.utils import secure_filename
@@ -85,7 +86,47 @@ def suggest_person_by_filename(db, filename):
     return candidates
 
 
-def save_person_document_batch(db, upload_root, person_id, files, document_type, remarks=None):
+def suggest_case_for_document(person, file_info):
+    """Return a case suggestion without ever using the person's name as evidence."""
+    cases = [dict(item) for item in file_info.get("cases", [])]
+    manual_case_id = file_info.get("person_case_id")
+    if manual_case_id:
+        matched = next((item for item in cases if item["id"] == int(manual_case_id)), None)
+        return {"case": matched, "confidence": 1.0, "status": "confirmed"} if matched else None
+    text = " ".join(filter(None, [file_info.get("folder_name"), file_info.get("filename")])).lower()
+    normalized = text.replace("–", "-").replace("—", "-")
+    type_tokens = {
+        "new_contract": ("新人", "首次", "新合约"),
+        "renewal": ("续约", "续约合同", "visa", "hk入表"),
+        "replacement": ("替补", "24个月"),
+    }
+    scored = []
+    ranges = set(re.findall(r"(?:19|20)\d{2}\s*-\s*(?:19|20)\d{2}", normalized))
+    for case in cases:
+        score = 0.0
+        if any(token in normalized for token in type_tokens.get(case["case_type"], ())):
+            score = max(score, 0.78)
+        label = (case.get("case_label") or "").lower().replace("–", "-").replace("—", "-")
+        if any(value.replace(" ", "") in label.replace(" ", "") for value in ranges):
+            score = max(score, 0.95)
+        if case.get("start_date") and case.get("end_date"):
+            date_range = f"{case['start_date'][:4]}-{case['end_date'][:4]}"
+            if date_range in normalized.replace(" ", ""):
+                score = max(score, 0.95)
+        if score:
+            scored.append((score, case))
+    scored.sort(key=lambda item: item[0], reverse=True)
+    if scored and (len(scored) == 1 or scored[0][0] > scored[1][0]):
+        return {"case": scored[0][1], "confidence": scored[0][0], "status": "suggested"}
+    active = [item for item in cases if item["status"] == "active"]
+    if len(active) == 1:
+        return {"case": active[0], "confidence": 0.55, "status": "suggested"}
+    return {"case": None, "confidence": 0.0, "status": "unassigned"}
+
+
+def save_person_document_batch(
+    db, upload_root, person_id, files, document_type, remarks=None, person_case_id=None,
+):
     files = [item for item in files if item and item.filename]
     if not files:
         raise ValueError("请选择至少一个文件")
@@ -93,10 +134,17 @@ def save_person_document_batch(db, upload_root, person_id, files, document_type,
         raise ValueError("单次最多上传50个文件")
     if document_type not in DOCUMENT_TYPES:
         document_type = "unknown"
-    if not db.execute(
-        "SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)
-    ).fetchone():
+    person = db.execute(
+        "SELECT * FROM people WHERE id=? AND is_deleted=0", (person_id,)
+    ).fetchone()
+    if not person:
         raise ValueError("绑定人员不存在")
+    cases = db.execute(
+        "SELECT * FROM person_cases WHERE person_id=? AND is_deleted=0 ORDER BY status='active' DESC,start_date DESC,id DESC",
+        (person_id,),
+    ).fetchall()
+    if person_case_id and not any(item["id"] == int(person_case_id) for item in cases):
+        raise ValueError("办理周期不属于所选人员")
 
     allowed = {"pdf", "jpg", "jpeg", "png", "doc", "docx"}
     max_size = 25 * 1024 * 1024
@@ -107,7 +155,14 @@ def save_person_document_batch(db, upload_root, person_id, files, document_type,
     used_names = set()
 
     for uploaded in files:
-        original = Path(uploaded.filename).name
+        source_name = uploaded.filename.replace("\\", "/")
+        original = Path(source_name).name
+        folder_name = source_name.rsplit("/", 1)[0] if "/" in source_name else ""
+        suggestion = suggest_case_for_document(
+            person,
+            {"filename": original, "folder_name": folder_name, "cases": cases,
+             "person_case_id": person_case_id},
+        )
         extension = original.rsplit(".", 1)[-1].lower() if "." in original else ""
         if extension not in allowed:
             result["skipped"] += 1
@@ -136,11 +191,15 @@ def save_person_document_batch(db, upload_root, person_id, files, document_type,
             db.execute(
                 """INSERT INTO person_documents
                    (person_id,document_type,original_filename,stored_path,mime_type,
-                    file_size,upload_batch_id,status,remarks)
-                   VALUES (?,?,?,?,?,?,?,?,?)""",
+                    file_size,upload_batch_id,status,remarks,person_case_id,
+                    inferred_case_confidence,case_binding_status)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (person_id, document_type, original, relative_path,
                  uploaded.mimetype or mimetypes.guess_type(original)[0] or "application/octet-stream",
-                 size, batch_id, "active", remarks),
+                 size, batch_id, "active", remarks,
+                 suggestion["case"]["id"] if suggestion and suggestion["case"] else None,
+                 suggestion["confidence"] if suggestion else 0.0,
+                 suggestion["status"] if suggestion else "unassigned"),
             )
             result["success"] += 1
         except Exception as error:
@@ -197,6 +256,18 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
         items = [item for item in documents if item["document_type"] == document_type]
         if items:
             document_groups.append({"type": document_type, "label": label, "items": items})
+    cases = [dict(row) for row in db.execute(
+        "SELECT * FROM person_cases WHERE person_id=? AND is_deleted=0 ORDER BY status='active' DESC,start_date DESC,id DESC",
+        (person_id,),
+    ).fetchall()]
+    case_sections = []
+    for case in cases:
+        items = [item for item in documents if item.get("person_case_id") == case["id"] and item.get("case_binding_status") == "confirmed"]
+        case_sections.append({"case": case, "items": items, "current": case["status"] == "active"})
+    unconfirmed_documents = [
+        item for item in documents
+        if not item.get("person_case_id") or item.get("case_binding_status") != "confirmed"
+    ]
     document_types = {item["document_type"] for item in documents}
     visa_query = get_entry_visa_query_key(person)
     appointment = check_hk_id_appointment_ready(person)
@@ -207,6 +278,9 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
         "person": person,
         "documents": documents,
         "document_groups": document_groups,
+        "person_cases": cases,
+        "case_sections": case_sections,
+        "unconfirmed_documents": unconfirmed_documents,
         "contracts": db.execute(
             "SELECT * FROM contracts WHERE person_id=? AND is_deleted=0 ORDER BY created_at DESC",
             (person_id,),

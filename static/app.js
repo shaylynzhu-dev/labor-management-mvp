@@ -23,11 +23,15 @@ window.labourApi = {request: apiFetch};
 
 function openInlineEditor(id) {
   const editor = document.getElementById(id);
-  if (!editor || !inlineEditorHost) return;
-  inlineEditorHost.querySelectorAll('dialog[open]').forEach((item) => item.close());
-  inlineEditorHost.append(editor);
-  inlineEditorHost.hidden = false;
-  editor.show();
+  if (!editor) return;
+  document.querySelectorAll('dialog[open]').forEach((item) => item.close());
+  if (inlineEditorHost) {
+    inlineEditorHost.append(editor);
+    inlineEditorHost.hidden = false;
+    editor.show();
+  } else {
+    editor.showModal();
+  }
   editor.querySelector('input, select, textarea, button')?.focus();
   inlineEditorHost.scrollIntoView({behavior: 'smooth', block: 'start'});
 }

@@ -7,6 +7,7 @@ from app import app, get_db, init_db
 from app.services.person_profile_service import (
     check_hk_id_appointment_ready, get_entry_visa_query_key,
     get_missing_documents, get_person_profile, suggest_person_by_filename,
+    save_person_document_batch, suggest_case_for_document,
 )
 
 
@@ -38,6 +39,12 @@ class PersonProfileTest(unittest.TestCase):
                 row["name"] for row in db.execute("PRAGMA table_info(person_documents)")
             }
             self.assertTrue({"mime_type", "file_size", "upload_batch_id"}.issubset(document_columns))
+            self.assertTrue({
+                "person_case_id", "inferred_case_confidence", "case_binding_status",
+            }.issubset(document_columns))
+            self.assertIsNotNone(db.execute(
+                "SELECT name FROM sqlite_master WHERE type='table' AND name='person_cases'"
+            ).fetchone())
 
             person = {
                 "worker_type": "new", "mainland_id_first4": "1234",
@@ -53,6 +60,52 @@ class PersonProfileTest(unittest.TestCase):
             db.commit()
             suggestions = suggest_person_by_filename(db, "陈小明_合同.pdf")
             self.assertEqual([item["name"] for item in suggestions], ["陈小明"])
+
+    def test_case_suggestion_prefers_folder_and_leaves_ambiguous_unassigned(self):
+        cases = [
+            {"id": 1, "case_type": "new_contract", "case_label": "新人合约 2024-2026", "status": "completed", "start_date": "2024-01-01", "end_date": "2026-01-01"},
+            {"id": 2, "case_type": "renewal", "case_label": "续约 2026-2028", "status": "active", "start_date": "2026-01-02", "end_date": "2028-01-01"},
+        ]
+        suggested = suggest_case_for_document({}, {
+            "filename": "合同.pdf", "folder_name": "续约 2026-2028", "cases": cases,
+        })
+        self.assertEqual(suggested["case"]["id"], 2)
+        self.assertEqual(suggested["status"], "suggested")
+        ambiguous_cases = [dict(cases[0], status="active"), cases[1]]
+        unassigned = suggest_case_for_document({}, {
+            "filename": "scan001.pdf", "cases": ambiguous_cases,
+        })
+        self.assertIsNone(unassigned["case"])
+        self.assertEqual(unassigned["status"], "unassigned")
+
+    def test_batch_upload_records_manual_case_as_confirmed(self):
+        with app.app_context():
+            db = get_db()
+            person_id = db.execute(
+                "INSERT INTO people(name,person_name,gender) VALUES ('周期人员','周期人员','男')"
+            ).lastrowid
+            case_id = db.execute(
+                "INSERT INTO person_cases(person_id,case_type,case_label,status) VALUES (?,?,?,?)",
+                (person_id, "renewal", "续约 2026-2028", "active"),
+            ).lastrowid
+            db.commit()
+            upload = type("Upload", (), {})()
+            upload.filename = "续约/合同.pdf"
+            upload.mimetype = "application/pdf"
+            upload.stream = io.BytesIO(b"case-document")
+            result = save_person_document_batch(
+                db, app.config["UPLOAD_FOLDER"], person_id, [upload], "contract",
+                person_case_id=case_id,
+            )
+            self.assertEqual(result["success"], 1)
+            row = db.execute(
+                "SELECT person_case_id,case_binding_status FROM person_documents WHERE person_id=?",
+                (person_id,),
+            ).fetchone()
+            self.assertEqual(
+                (row["person_case_id"], row["case_binding_status"]),
+                (case_id, "confirmed"),
+            )
 
     def test_profile_masks_entry_permit_for_non_admin(self):
         with app.app_context():

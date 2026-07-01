@@ -25,7 +25,7 @@ from app.services.dispatch_engine import (
 )
 from app.services.person_profile_service import (
     DOCUMENT_TYPES, get_person_profile, save_person_document_batch,
-    suggest_person_by_filename,
+    suggest_case_for_document, suggest_person_by_filename,
 )
 
 
@@ -757,7 +757,7 @@ def close_db(_error=None):
 
 SOFT_DELETE_TABLES = (
     "people", "quotas", "contracts", "events", "renewals",
-    "workflow_instances", "documents", "person_documents", "lifecycle_nodes", "risks", "tasks",
+    "workflow_instances", "documents", "person_cases", "person_documents", "lifecycle_nodes", "risks", "tasks",
     "person", "quota", "contract", "event", "risk",
 )
 
@@ -770,6 +770,7 @@ SOFT_DELETE_RESOURCES = {
     "workflows": ("workflow_instances", "id", None, None),
     "documents": ("documents", "id", None, None),
     "person_documents": ("person_documents", "id", None, None),
+    "person_cases": ("person_cases", "id", None, None),
     "lifecycle": ("lifecycle_nodes", "id", None, None),
     "risks": ("risks", "id", "risk", "id"),
     "tasks": ("tasks", "id", None, None),
@@ -780,6 +781,7 @@ SOFT_DELETE_ALIASES = {
     "event": "events", "renewal": "renewals", "workflow": "workflows",
     "document": "documents", "risk": "risks", "task": "tasks",
     "person_document": "person_documents", "person-documents": "person_documents",
+    "person_case": "person_cases", "person-cases": "person_cases",
     "workflow_instances": "workflows", "lifecycle-node": "lifecycle",
     "lifecycle_nodes": "lifecycle",
 }
@@ -960,6 +962,27 @@ def init_db():
             FOREIGN KEY (workflow_id) REFERENCES workflow_instances(id) ON DELETE CASCADE
         );
 
+        CREATE TABLE IF NOT EXISTS person_cases (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_id INTEGER NOT NULL,
+            case_type TEXT NOT NULL DEFAULT 'other',
+            case_label TEXT NOT NULL,
+            start_date TEXT,
+            end_date TEXT,
+            quota_id INTEGER,
+            contract_id TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            remarks TEXT,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            is_deleted INTEGER NOT NULL DEFAULT 0,
+            deleted_at DATETIME,
+            deleted_by INTEGER,
+            FOREIGN KEY(person_id) REFERENCES people(id) ON DELETE RESTRICT,
+            FOREIGN KEY(quota_id) REFERENCES quotas(id) ON DELETE SET NULL,
+            FOREIGN KEY(contract_id) REFERENCES contracts(contract_id) ON DELETE SET NULL
+        );
+
         CREATE TABLE IF NOT EXISTS person_documents (
             id INTEGER PRIMARY KEY AUTOINCREMENT,
             person_id INTEGER NOT NULL,
@@ -969,6 +992,9 @@ def init_db():
             mime_type TEXT,
             file_size INTEGER NOT NULL DEFAULT 0,
             upload_batch_id TEXT,
+            person_case_id INTEGER,
+            inferred_case_confidence REAL,
+            case_binding_status TEXT NOT NULL DEFAULT 'unassigned',
             ocr_text TEXT NOT NULL DEFAULT '',
             issue_date TEXT,
             expiry_date TEXT,
@@ -978,7 +1004,8 @@ def init_db():
             is_deleted INTEGER NOT NULL DEFAULT 0,
             deleted_at DATETIME,
             deleted_by INTEGER,
-            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE RESTRICT
+            FOREIGN KEY (person_id) REFERENCES people(id) ON DELETE RESTRICT,
+            FOREIGN KEY (person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL
         );
 
         CREATE TABLE IF NOT EXISTS lifecycle_nodes (
@@ -1065,6 +1092,8 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_documents_binding ON documents(person_id, quota_id, workflow_id);
         CREATE INDEX IF NOT EXISTS idx_person_documents_person ON person_documents(person_id,is_deleted);
         CREATE INDEX IF NOT EXISTS idx_person_documents_type ON person_documents(document_type,status);
+        CREATE INDEX IF NOT EXISTS idx_person_documents_case ON person_documents(person_case_id,case_binding_status);
+        CREATE INDEX IF NOT EXISTS idx_person_cases_person ON person_cases(person_id,status,is_deleted);
         CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflow_instances(status);
         CREATE INDEX IF NOT EXISTS idx_lifecycle_due ON lifecycle_nodes(due_date, status);
         CREATE INDEX IF NOT EXISTS idx_risks_level ON risks(risk_level, status);
@@ -1159,7 +1188,9 @@ def init_db():
     }
     for column, definition in {
         "mime_type": "TEXT", "file_size": "INTEGER NOT NULL DEFAULT 0",
-        "upload_batch_id": "TEXT",
+        "upload_batch_id": "TEXT", "person_case_id": "INTEGER",
+        "inferred_case_confidence": "REAL",
+        "case_binding_status": "TEXT NOT NULL DEFAULT 'unassigned'",
     }.items():
         if column not in person_document_columns:
             db.execute(f"ALTER TABLE person_documents ADD COLUMN {column} {definition}")
@@ -1979,6 +2010,9 @@ def index(default_view="overview"):
         active_view = "overview"
     keyword = request.args.get("q", "").strip()
     document_keyword = request.args.get("doc_q", "").strip()
+    selected_case_scope = request.args.get("case_scope", "").strip()
+    if selected_case_scope not in {"current", "history", "unbound_person", "unconfirmed"}:
+        selected_case_scope = ""
     document_upload_result = session.pop("person_document_upload_result", None)
     selected_status = request.args.get("status", "").strip()
     selected_visa_status = request.args.get("visa_status", "").strip()
@@ -2092,6 +2126,7 @@ def index(default_view="overview"):
     documents = db.execute(
         """
         SELECT d.*, p.name AS person_name, p.company_name,
+               pc.case_label,pc.status AS case_status,
                COALESCE((SELECT title FROM documents old
                          WHERE old.stored_name=d.stored_path LIMIT 1),d.original_filename) AS display_title,
                CASE d.document_type
@@ -2107,12 +2142,19 @@ def index(default_view="overview"):
                     THEN 1 ELSE 0 END AS is_expired
         FROM person_documents d
         JOIN people p ON p.id=d.person_id AND p.is_deleted=0
+        LEFT JOIN person_cases pc ON pc.id=d.person_case_id AND pc.is_deleted=0
         WHERE d.is_deleted=0
           AND (?='' OR d.original_filename LIKE ? OR d.ocr_text LIKE ?
                OR p.name LIKE ? OR p.company_name LIKE ?)
+          AND (?='' OR (?='current' AND pc.status='active' AND d.case_binding_status='confirmed')
+                    OR (?='history' AND pc.status IN ('completed','archived') AND d.case_binding_status='confirmed')
+                    OR (?='unbound_person' AND d.person_id IS NULL)
+                    OR (?='unconfirmed' AND (d.person_case_id IS NULL OR d.case_binding_status!='confirmed')))
         ORDER BY d.uploaded_at DESC,d.id DESC
         """,
-        (effective_document_keyword, doc_like, doc_like, doc_like, doc_like),
+        (effective_document_keyword, doc_like, doc_like, doc_like, doc_like,
+         selected_case_scope, selected_case_scope, selected_case_scope,
+         selected_case_scope, selected_case_scope),
     ).fetchall()
     workflows = db.execute(
         """
@@ -2458,7 +2500,14 @@ def index(default_view="overview"):
                 "needs_action": "Yes" if is_entry else "No",
                 "detail_url": url_for("index", view="events", q=event["person_name"]),
             }
-    all_people = db.execute("SELECT id, name FROM people WHERE is_deleted=0 ORDER BY name").fetchall()
+    all_people = db.execute(
+        "SELECT id,name,company_name,worker_type,entry_permit_no,visa_status FROM people WHERE is_deleted=0 ORDER BY name"
+    ).fetchall()
+    all_person_cases = db.execute(
+        """SELECT pc.*,p.name AS person_name FROM person_cases pc
+           JOIN people p ON p.id=pc.person_id AND p.is_deleted=0
+           WHERE pc.is_deleted=0 ORDER BY pc.status='active' DESC,pc.start_date DESC,pc.id DESC"""
+    ).fetchall()
     available_people = db.execute(
         """SELECT p.id, p.name FROM people p
            LEFT JOIN quotas q ON q.person_id = p.id AND q.is_deleted=0
@@ -2485,6 +2534,7 @@ def index(default_view="overview"):
         boss_dashboard=boss_dashboard,
         counts=counts,
         all_people=all_people,
+        all_person_cases=all_person_cases,
         available_people=available_people,
         keyword=keyword,
         selected_status=selected_status,
@@ -2495,6 +2545,7 @@ def index(default_view="overview"):
         task_statuses=TASK_STATUSES,
         active_view=active_view,
         document_keyword=document_keyword,
+        selected_case_scope=selected_case_scope,
         document_upload_result=document_upload_result,
         import_result=import_result,
         today=date.today().isoformat(),
@@ -2575,6 +2626,31 @@ def update_person_profile(person_id):
     record_standard_event(db, "person_updated", "人员档案字段已更新", person_id=person_id)
     db.commit()
     flash("人员档案已保存。", "success")
+    return redirect(url_for("person_detail", person_id=person_id))
+
+
+@app.post("/people/<int:person_id>/cases")
+def create_person_case(person_id):
+    db = get_db()
+    if not db.execute("SELECT 1 FROM people WHERE id=? AND is_deleted=0", (person_id,)).fetchone():
+        abort(404)
+    case_type = request.form.get("case_type", "other")
+    status = request.form.get("status", "active")
+    case_label = request.form.get("case_label", "").strip()
+    if case_type not in {"new_contract", "renewal", "replacement", "other"} or status not in {"active", "completed", "archived"} or not case_label:
+        flash("办理周期类型、名称或状态无效。", "error")
+        return redirect(url_for("person_detail", person_id=person_id))
+    db.execute(
+        """INSERT INTO person_cases
+           (person_id,case_type,case_label,start_date,end_date,quota_id,contract_id,status,remarks)
+           VALUES (?,?,?,?,?,?,?,?,?)""",
+        (person_id, case_type, case_label,
+         request.form.get("start_date") or None, request.form.get("end_date") or None,
+         request.form.get("quota_id") or None, request.form.get("contract_id") or None,
+         status, request.form.get("remarks") or None),
+    )
+    db.commit()
+    flash("办理周期已创建。", "success")
     return redirect(url_for("person_detail", person_id=person_id))
 
 
@@ -3715,6 +3791,7 @@ def upload_person_document_batch():
             request.files.getlist("files"),
             request.form.get("document_type", "unknown"),
             (request.form.get("remarks") or "").strip() or None,
+            request.form.get("person_case_id") or None,
         )
         session["person_document_upload_result"] = result
         flash(
@@ -3731,6 +3808,45 @@ def upload_person_document_batch():
     if return_to == "person" and person_id_value:
         return redirect(url_for("person_detail", person_id=person_id_value))
     return redirect(url_for("index", view="documents"))
+
+
+@app.post("/person-documents/<int:document_id>/case")
+def confirm_person_document_case(document_id):
+    db = get_db()
+    document = db.execute(
+        "SELECT * FROM person_documents WHERE id=? AND is_deleted=0", (document_id,)
+    ).fetchone()
+    if not document:
+        abort(404)
+    person_case_id = request.form.get("person_case_id", "").strip()
+    if person_case_id and not db.execute(
+        "SELECT 1 FROM person_cases WHERE id=? AND person_id=? AND is_deleted=0",
+        (person_case_id, document["person_id"]),
+    ).fetchone():
+        flash("选择的办理周期无效。", "error")
+    else:
+        db.execute(
+            """UPDATE person_documents SET person_case_id=?,case_binding_status=?,
+                      inferred_case_confidence=? WHERE id=?""",
+            (person_case_id or None, "confirmed" if person_case_id else "unassigned",
+             1.0 if person_case_id else 0.0, document_id),
+        )
+        db.commit()
+        flash("资料办理周期已确认。", "success")
+    return redirect(url_for("person_detail", person_id=document["person_id"]))
+
+
+@app.get("/api/people/<int:person_id>/cases/suggest")
+def suggest_person_case_api(person_id):
+    db = get_db()
+    person = db.execute("SELECT * FROM people WHERE id=? AND is_deleted=0", (person_id,)).fetchone()
+    if not person:
+        return api_response(404, "人员不存在", None, 404)
+    cases = db.execute("SELECT * FROM person_cases WHERE person_id=? AND is_deleted=0", (person_id,)).fetchall()
+    suggestion = suggest_case_for_document(
+        person, {"filename": request.args.get("filename", "")[:255], "cases": cases}
+    )
+    return api_response(0, "ok", suggestion)
 
 
 @app.get("/documents/<int:document_id>/download")

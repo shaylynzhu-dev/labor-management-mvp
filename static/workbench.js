@@ -133,6 +133,7 @@
     const inputs = Array.from(form.querySelectorAll('input[type="file"][name="files"]'));
     const countLabel = form.querySelector('[data-upload-file-count]');
     const personSelect = form.querySelector('[data-batch-person]');
+    const caseSelect = form.querySelector('[data-batch-case]');
     const suggestion = form.querySelector('[data-batch-suggestion]');
     const files = () => inputs.flatMap((input) => Array.from(input.files || []));
     const refresh = () => {
@@ -143,6 +144,7 @@
       const matches = options.filter((option) => selected.some((file) => file.name.includes(option.dataset.personName)));
       if (matches.length === 1) {
         personSelect.value = matches[0].value;
+        refreshCases();
         suggestion.textContent = `已按文件名推荐：${matches[0].dataset.personName}`;
         suggestion.hidden = false;
       } else if (matches.length > 1) {
@@ -154,12 +156,32 @@
       }
     };
     inputs.forEach((input) => input.addEventListener('change', refresh));
+    const refreshCases = () => {
+      if (!personSelect || !caseSelect) return;
+      caseSelect.value = '';
+      Array.from(caseSelect.options).forEach((option) => {
+        if (!option.dataset.personId) return;
+        option.hidden = option.dataset.personId !== personSelect.value;
+      });
+    };
+    personSelect?.addEventListener('change', refreshCases);
+    refreshCases();
     form.addEventListener('submit', (event) => {
       const selected = files();
       const oversized = selected.find((file) => file.size > 25 * 1024 * 1024);
       if (!selected.length || selected.length > 50 || oversized) {
         event.preventDefault();
         window.alert(!selected.length ? '请至少选择一个文件。' : selected.length > 50 ? '单次最多上传50个文件。' : `${oversized.name} 超过25MB。`);
+        return;
+      }
+      if (personSelect) {
+        const person = personSelect.options[personSelect.selectedIndex];
+        const visibleCases = Array.from(caseSelect?.options || []).filter((option) => option.dataset.personId === personSelect.value);
+        if (visibleCases.length > 1 || !caseSelect?.value) {
+          const selectedCase = caseSelect?.value ? caseSelect.options[caseSelect.selectedIndex].textContent : '暂不绑定 / 系统建议';
+          const confirmed = window.confirm(`请二次确认资料归档：\n人员：${person.dataset.personName}\n公司：${person.dataset.company || '待补充'}\n人员类型：${person.dataset.workerType === 'renewal' ? '续约' : '新人'}\n入境签证号：${person.dataset.entryPermit || '待补充'}\n办理周期：${selectedCase}\nVISA状态：${person.dataset.visaStatus || '未出'}\n\n确认继续上传？`);
+          if (!confirmed) event.preventDefault();
+        }
       }
     });
   });

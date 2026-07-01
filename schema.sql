@@ -37,6 +37,9 @@ CREATE TABLE IF NOT EXISTS person_documents (
     mime_type TEXT NULL,
     file_size INTEGER NOT NULL DEFAULT 0,
     upload_batch_id TEXT NULL,
+    person_case_id INTEGER NULL,
+    inferred_case_confidence REAL NULL,
+    case_binding_status TEXT NOT NULL DEFAULT 'unassigned',
     ocr_text TEXT NOT NULL DEFAULT '',
     issue_date DATE NULL,
     expiry_date DATE NULL,
@@ -46,7 +49,29 @@ CREATE TABLE IF NOT EXISTS person_documents (
     is_deleted INTEGER NOT NULL DEFAULT 0,
     deleted_at DATETIME NULL,
     deleted_by INTEGER NULL,
-    FOREIGN KEY(person_id) REFERENCES person(id) ON DELETE RESTRICT
+    FOREIGN KEY(person_id) REFERENCES person(id) ON DELETE RESTRICT,
+    FOREIGN KEY(person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_cases (
+    id INTEGER PRIMARY KEY,
+    person_id INTEGER NOT NULL,
+    case_type TEXT NOT NULL DEFAULT 'other',
+    case_label TEXT NOT NULL,
+    start_date DATE NULL,
+    end_date DATE NULL,
+    quota_id INTEGER NULL,
+    contract_id INTEGER NULL,
+    status TEXT NOT NULL DEFAULT 'active',
+    remarks TEXT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    is_deleted INTEGER NOT NULL DEFAULT 0,
+    deleted_at DATETIME NULL,
+    deleted_by INTEGER NULL,
+    FOREIGN KEY(person_id) REFERENCES person(id) ON DELETE RESTRICT,
+    FOREIGN KEY(quota_id) REFERENCES quota(id) ON DELETE SET NULL,
+    FOREIGN KEY(contract_id) REFERENCES contract(id) ON DELETE SET NULL
 );
 
 CREATE TABLE IF NOT EXISTS quota (
