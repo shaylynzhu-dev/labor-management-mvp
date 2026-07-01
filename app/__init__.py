@@ -8,7 +8,8 @@ from config import get_config
 from .models.legacy_runtime import app as _legacy_app, init_db as initialize_legacy_database
 from .models import Database, ImportLogRepository, LegacyBusinessRepository, UserRepository
 from .routes import auth_bp, imports_bp, quota_api_bp, quota_bp, quota_legacy_bp
-from .services import AuthService, ExcelImportService, init_quota_service
+from .services import AuthService, ExcelImportService
+from .services.quota_service import init_quota_service
 from .utils.responses import api_response
 from .utils.logging import configure_logging
 

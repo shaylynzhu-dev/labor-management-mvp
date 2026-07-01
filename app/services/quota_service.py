@@ -1,11 +1,14 @@
-from datetime import date
+import calendar
+from datetime import date, datetime
 
 from flask import current_app
 from sqlalchemy import create_engine, select, text
 from sqlalchemy.orm import Session
 
 from app.models.quota import Quota
-from app.models.legacy_runtime import build_quota_views, get_db
+
+
+QUOTA_TOTAL_MONTHS = 24
 
 
 def init_quota_service(app):
@@ -30,6 +33,84 @@ def _engine():
     return engine
 
 
+def _shift_months(value, months):
+    month_index = value.month - 1 + months
+    year = value.year + month_index // 12
+    month = month_index % 12 + 1
+    day = min(value.day, calendar.monthrange(year, month)[1])
+    return date(year, month, day)
+
+
+def _calculate_usage_months(start_date, end_date=None):
+    start = datetime.strptime(start_date, "%Y-%m-%d").date()
+    effective_end = (
+        datetime.strptime(end_date, "%Y-%m-%d").date() if end_date else date.today()
+    )
+    if effective_end <= start:
+        return 0
+    complete_months = (
+        (effective_end.year - start.year) * 12 + effective_end.month - start.month
+    )
+    anniversary = _shift_months(start, complete_months)
+    if anniversary > effective_end:
+        complete_months -= 1
+        anniversary = _shift_months(start, complete_months)
+    return complete_months + (1 if effective_end > anniversary else 0)
+
+
+def _build_quota_view(session, quota_model, assigned_person_name):
+    quota = quota_model.as_dict()
+    quota["person_name"] = assigned_person_name
+    history = [
+        dict(row)
+        for row in session.execute(
+            text(
+                """SELECT u.*, p.name AS person_name
+                   FROM quota_usages u
+                   JOIN people p ON p.id=u.person_id AND p.is_deleted=0
+                   WHERE u.quota_id=:id
+                   ORDER BY u.start_date, u.id"""
+            ),
+            {"id": quota_model.id},
+        ).mappings()
+    ]
+    for usage in history:
+        usage["months"] = _calculate_usage_months(
+            usage["start_date"], usage["end_date"]
+        )
+    active = next(
+        (usage for usage in reversed(history) if usage["end_date"] is None), None
+    )
+    if quota_model.quota_type == "SWD":
+        used_months = active["months"] if active else 0
+        calculation_label = "仅当前使用人"
+    else:
+        used_months = sum(usage["months"] for usage in history)
+        calculation_label = "全部人员累计"
+    remaining_months = max(QUOTA_TOTAL_MONTHS - used_months, 0)
+    if remaining_months == 0 and quota_model.status != "invalid":
+        quota_model.status = "exhausted"
+        quota["status"] = "exhausted"
+    display_label = (
+        quota_model.quota_serial
+        or quota_model.approval_number
+        or quota_model.quota_number
+        or f"未编号 #{quota_model.id}"
+    )
+    if not quota["quota_number"]:
+        quota["quota_number"] = display_label
+    quota.update(
+        history=history,
+        active_usage=active,
+        person_name=active["person_name"] if active else assigned_person_name,
+        used_months=used_months,
+        remaining_months=remaining_months,
+        calculation_label=calculation_label,
+        display_label=display_label,
+    )
+    return quota
+
+
 def get_quota_detail(quota_id):
     """Load the complete quota-detail context without leaking queries to routes."""
     with Session(_engine()) as session:
@@ -38,14 +119,15 @@ def get_quota_detail(quota_id):
         )
         if quota_model is None:
             return None
-        quota_row = quota_model.as_dict()
         if quota_model.person_id:
-            quota_row["person_name"] = session.execute(
+            assigned_person_name = session.execute(
                 text("SELECT name FROM people WHERE id=:id AND is_deleted=0"),
                 {"id": quota_model.person_id},
             ).scalar_one_or_none()
         else:
-            quota_row["person_name"] = None
+            assigned_person_name = None
+
+        quota = _build_quota_view(session, quota_model, assigned_person_name)
 
         related = {
             "workflows": session.execute(
@@ -82,10 +164,7 @@ def get_quota_detail(quota_id):
                 text("SELECT id, name FROM people WHERE is_deleted=0 ORDER BY name")
             ).mappings().all(),
         }
-
-    # Preserve the established SWD/LD calculation behavior while moving its
-    # orchestration out of the route layer.
-    quota = build_quota_views(get_db(), [quota_row])[0]
+        session.commit()
     return {
         "quota": quota,
         "related": related,
