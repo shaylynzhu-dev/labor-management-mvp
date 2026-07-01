@@ -1,4 +1,5 @@
-from datetime import date
+from datetime import date, datetime, timedelta
+import calendar
 from pathlib import Path
 import mimetypes
 import re
@@ -24,6 +25,8 @@ DOCUMENT_TYPES = {
 }
 
 BASE_REQUIRED_DOCUMENTS = ("resume", "contract", "mainland_id", "hkmo_permit")
+CONTRACT_RESTART_LEAD_DAYS = 30
+DOCUMENT_COLLECTION_LEAD_MONTHS = 1
 
 
 def _value(person, key):
@@ -122,6 +125,63 @@ def suggest_case_for_document(person, file_info):
     if len(active) == 1:
         return {"case": active[0], "confidence": 0.55, "status": "suggested"}
     return {"case": None, "confidence": 0.0, "status": "unassigned"}
+
+
+def _parse_date(value):
+    if not value:
+        return None
+    if isinstance(value, datetime):
+        return value.date()
+    if isinstance(value, date):
+        return value
+    try:
+        return datetime.strptime(str(value)[:10], "%Y-%m-%d").date()
+    except (TypeError, ValueError):
+        return None
+
+
+def _subtract_months(value, months):
+    target_month = value.month - months
+    year = value.year + (target_month - 1) // 12
+    month = (target_month - 1) % 12 + 1
+    return value.replace(year=year, month=month, day=min(value.day, calendar.monthrange(year, month)[1]))
+
+
+def calculate_renewal_alert_dates(person_case):
+    """Calculate renewal dates in the service layer; missing dates stay safely empty."""
+    contract_end = _parse_date(_value(person_case, "contract_end_date") or _value(person_case, "end_date"))
+    endorsement_expiry = _parse_date(_value(person_case, "endorsement_expiry_date"))
+    return {
+        "contract_restart_due_date": (
+            contract_end - timedelta(days=CONTRACT_RESTART_LEAD_DAYS)
+        ).isoformat() if contract_end else None,
+        "document_collection_due_date": (
+            _subtract_months(endorsement_expiry, DOCUMENT_COLLECTION_LEAD_MONTHS).isoformat()
+            if endorsement_expiry else None
+        ),
+    }
+
+
+def get_renewal_alert_summary(person_case, today=None):
+    today = today or date.today()
+    calculated = calculate_renewal_alert_dates(person_case)
+    alerts = []
+    for key, upcoming_label in (
+        ("contract_restart_due_date", "即将合同重启"),
+        ("document_collection_due_date", "即将收证件办理续签"),
+    ):
+        due = _parse_date(_value(person_case, key) or calculated[key])
+        if not due:
+            continue
+        remaining = (due - today).days
+        if remaining < 0:
+            label = "已逾期未处理"
+        elif remaining <= CONTRACT_RESTART_LEAD_DAYS:
+            label = upcoming_label
+        else:
+            label = "日期已设置"
+        alerts.append({"type": key, "due_date": due.isoformat(), "remaining_days": remaining, "label": label})
+    return alerts
 
 
 def save_person_document_batch(
@@ -260,6 +320,11 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
         "SELECT * FROM person_cases WHERE person_id=? AND is_deleted=0 ORDER BY status='active' DESC,start_date DESC,id DESC",
         (person_id,),
     ).fetchall()]
+    for case in cases:
+        calculated = calculate_renewal_alert_dates(case)
+        case["contract_restart_due_date"] = case.get("contract_restart_due_date") or calculated["contract_restart_due_date"]
+        case["document_collection_due_date"] = case.get("document_collection_due_date") or calculated["document_collection_due_date"]
+        case["renewal_alerts"] = get_renewal_alert_summary(case)
     case_sections = []
     for case in cases:
         items = [item for item in documents if item.get("person_case_id") == case["id"] and item.get("case_binding_status") == "confirmed"]

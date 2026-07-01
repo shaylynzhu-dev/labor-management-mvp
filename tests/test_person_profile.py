@@ -5,7 +5,7 @@ from pathlib import Path
 
 from app import app, get_db, init_db
 from app.services.person_profile_service import (
-    check_hk_id_appointment_ready, get_entry_visa_query_key,
+    calculate_renewal_alert_dates, check_hk_id_appointment_ready, get_entry_visa_query_key,
     get_missing_documents, get_person_profile, suggest_person_by_filename,
     save_person_document_batch, suggest_case_for_document,
 )
@@ -77,6 +77,18 @@ class PersonProfileTest(unittest.TestCase):
         })
         self.assertIsNone(unassigned["case"])
         self.assertEqual(unassigned["status"], "unassigned")
+
+    def test_renewal_alert_dates_are_calculated_and_missing_dates_are_safe(self):
+        result = calculate_renewal_alert_dates({
+            "contract_end_date": "2026-08-31",
+            "endorsement_expiry_date": "2026-03-31",
+        })
+        self.assertEqual(result["contract_restart_due_date"], "2026-08-01")
+        self.assertEqual(result["document_collection_due_date"], "2026-02-28")
+        self.assertEqual(calculate_renewal_alert_dates({}), {
+            "contract_restart_due_date": None,
+            "document_collection_due_date": None,
+        })
 
     def test_batch_upload_records_manual_case_as_confirmed(self):
         with app.app_context():

@@ -60,6 +60,12 @@ CREATE TABLE IF NOT EXISTS person_cases (
     case_label TEXT NOT NULL,
     start_date DATE NULL,
     end_date DATE NULL,
+    contract_start_date DATE NULL,
+    contract_end_date DATE NULL,
+    contract_restart_due_date DATE NULL,
+    endorsement_expiry_date DATE NULL,
+    document_collection_due_date DATE NULL,
+    renewal_alert_status TEXT NOT NULL DEFAULT 'pending',
     quota_id INTEGER NULL,
     contract_id INTEGER NULL,
     status TEXT NOT NULL DEFAULT 'active',
@@ -150,6 +156,8 @@ CREATE TABLE IF NOT EXISTS risk (
     person_id INTEGER,
     quota_id INTEGER,
     contract_id INTEGER,
+    person_case_id INTEGER,
+    due_date DATE NULL,
     risk_type TEXT,
     status TEXT DEFAULT 'open',
     description TEXT,
@@ -159,7 +167,8 @@ CREATE TABLE IF NOT EXISTS risk (
     created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     FOREIGN KEY (person_id) REFERENCES person(id) ON DELETE SET NULL,
     FOREIGN KEY (quota_id) REFERENCES quota(id) ON DELETE SET NULL,
-    FOREIGN KEY (contract_id) REFERENCES contract(id) ON DELETE SET NULL
+    FOREIGN KEY (contract_id) REFERENCES contract(id) ON DELETE SET NULL,
+    FOREIGN KEY (person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL
 );
 
 CREATE UNIQUE INDEX IF NOT EXISTS idx_contract_contract_no

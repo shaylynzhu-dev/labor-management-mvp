@@ -24,7 +24,7 @@ from app.services.dispatch_engine import (
     transition_contract, trigger_worker_departure,
 )
 from app.services.person_profile_service import (
-    DOCUMENT_TYPES, get_person_profile, save_person_document_batch,
+    DOCUMENT_TYPES, calculate_renewal_alert_dates, get_person_profile, save_person_document_batch,
     suggest_case_for_document, suggest_person_by_filename,
 )
 
@@ -969,6 +969,12 @@ def init_db():
             case_label TEXT NOT NULL,
             start_date TEXT,
             end_date TEXT,
+            contract_start_date TEXT,
+            contract_end_date TEXT,
+            contract_restart_due_date TEXT,
+            endorsement_expiry_date TEXT,
+            document_collection_due_date TEXT,
+            renewal_alert_status TEXT NOT NULL DEFAULT 'pending',
             quota_id INTEGER,
             contract_id TEXT,
             status TEXT NOT NULL DEFAULT 'active',
@@ -1029,6 +1035,8 @@ def init_db():
             person_id INTEGER,
             quota_id INTEGER,
             contract_id TEXT,
+            person_case_id INTEGER,
+            due_date TEXT,
             risk_type TEXT NOT NULL,
             risk_level TEXT NOT NULL CHECK(risk_level IN ('低','中','高')),
             reason TEXT NOT NULL,
@@ -1046,6 +1054,7 @@ def init_db():
             person_id INTEGER NOT NULL,
             quota_id INTEGER,
             workflow_id INTEGER,
+            person_case_id INTEGER,
             title TEXT NOT NULL,
             due_date TEXT NOT NULL,
             status TEXT NOT NULL DEFAULT '待办'
@@ -1092,8 +1101,6 @@ def init_db():
         CREATE INDEX IF NOT EXISTS idx_documents_binding ON documents(person_id, quota_id, workflow_id);
         CREATE INDEX IF NOT EXISTS idx_person_documents_person ON person_documents(person_id,is_deleted);
         CREATE INDEX IF NOT EXISTS idx_person_documents_type ON person_documents(document_type,status);
-        CREATE INDEX IF NOT EXISTS idx_person_documents_case ON person_documents(person_case_id,case_binding_status);
-        CREATE INDEX IF NOT EXISTS idx_person_cases_person ON person_cases(person_id,status,is_deleted);
         CREATE INDEX IF NOT EXISTS idx_workflows_status ON workflow_instances(status);
         CREATE INDEX IF NOT EXISTS idx_lifecycle_due ON lifecycle_nodes(due_date, status);
         CREATE INDEX IF NOT EXISTS idx_risks_level ON risks(risk_level, status);
@@ -1194,6 +1201,31 @@ def init_db():
     }.items():
         if column not in person_document_columns:
             db.execute(f"ALTER TABLE person_documents ADD COLUMN {column} {definition}")
+    person_case_columns = {
+        row["name"] for row in db.execute("PRAGMA table_info(person_cases)").fetchall()
+    }
+    for column, definition in {
+        "contract_start_date": "TEXT", "contract_end_date": "TEXT",
+        "contract_restart_due_date": "TEXT", "endorsement_expiry_date": "TEXT",
+        "document_collection_due_date": "TEXT",
+        "renewal_alert_status": "TEXT NOT NULL DEFAULT 'pending'",
+    }.items():
+        if column not in person_case_columns:
+            db.execute(f"ALTER TABLE person_cases ADD COLUMN {column} {definition}")
+    for table, additions in {
+        "risks": {"person_case_id": "INTEGER", "due_date": "TEXT"},
+        "tasks": {"person_case_id": "INTEGER"},
+    }.items():
+        existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
+        for column, definition in additions.items():
+            if column not in existing:
+                db.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_person_documents_case ON person_documents(person_case_id,case_binding_status)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_person_cases_person ON person_cases(person_id,status,is_deleted)"
+    )
     db.execute(
         """UPDATE people SET person_name=COALESCE(NULLIF(person_name,''),name),
                   worker_type=CASE WHEN worker_type IN ('new','renewal') THEN worker_type ELSE 'new' END,
@@ -1695,6 +1727,86 @@ def create_entry_tasks(db, person_id, event_day=None, workflow_id=None, quota_id
         )
 
 
+def refresh_person_case_alerts(db):
+    """Synchronize person-case reminder dates into the existing risk and task centers."""
+    today = date.today()
+    for row in db.execute(
+        "SELECT * FROM person_cases WHERE is_deleted=0"
+    ).fetchall():
+        case = dict(row)
+        calculated = calculate_renewal_alert_dates(case)
+        restart_due = case.get("contract_restart_due_date") or calculated["contract_restart_due_date"]
+        collection_due = case.get("document_collection_due_date") or calculated["document_collection_due_date"]
+        db.execute(
+            """UPDATE person_cases SET contract_restart_due_date=?,document_collection_due_date=?,
+                      updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+            (restart_due, collection_due, case["id"]),
+        )
+        closed = case.get("renewal_alert_status") in {"completed", "ignored"}
+        reminders = (
+            ("contract_restart_due", "合同重启提醒", "合同重启待办", restart_due),
+            ("endorsement_collection_due", "收证件办理续签提醒", "收证件办理签注待办", collection_due),
+        )
+        emitted = False
+        for risk_type, risk_label, task_title, due_value in reminders:
+            source_key = f"AUTO:person-case:{case['id']}:{risk_type}"
+            task_key = f"PERSON_CASE:{case['id']}:{risk_type}"
+            if closed or not due_value:
+                db.execute(
+                    "UPDATE risks SET status='已解决',updated_at=CURRENT_TIMESTAMP WHERE source_key=?",
+                    (source_key,),
+                )
+                if closed:
+                    db.execute(
+                        "UPDATE tasks SET status='已完成',updated_at=CURRENT_TIMESTAMP WHERE source_key=?",
+                        (task_key,),
+                    )
+                continue
+            try:
+                due = datetime.strptime(due_value, "%Y-%m-%d").date()
+            except (TypeError, ValueError):
+                continue
+            remaining = (due - today).days
+            if remaining > 30:
+                continue
+            emitted = True
+            level = "高" if remaining < 0 else "中"
+            timing = f"已逾期 {abs(remaining)} 天" if remaining < 0 else f"剩余 {remaining} 天"
+            db.execute(
+                """INSERT INTO risks
+                   (person_id,quota_id,contract_id,person_case_id,due_date,risk_type,
+                    risk_level,reason,status,source_key,is_deleted,deleted_at)
+                   VALUES (?,?,?,?,?,?,?,?, '开放',?,0,NULL)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                     person_id=excluded.person_id,quota_id=excluded.quota_id,
+                     contract_id=excluded.contract_id,person_case_id=excluded.person_case_id,
+                     due_date=excluded.due_date,risk_type=excluded.risk_type,
+                     risk_level=excluded.risk_level,reason=excluded.reason,status='开放',
+                     is_deleted=0,deleted_at=NULL,updated_at=CURRENT_TIMESTAMP""",
+                (case["person_id"], case.get("quota_id"), case.get("contract_id"), case["id"],
+                 due_value, risk_type, level, f"{risk_label}：{timing}", source_key),
+            )
+            db.execute(
+                """INSERT INTO tasks
+                   (person_id,quota_id,workflow_id,person_case_id,title,due_date,
+                    status,trigger_type,source_key,is_deleted,deleted_at)
+                   VALUES (?,?,NULL,?,?,?,'待办','续约周期',?,0,NULL)
+                   ON CONFLICT(source_key) DO UPDATE SET
+                     person_id=excluded.person_id,quota_id=excluded.quota_id,
+                     person_case_id=excluded.person_case_id,title=excluded.title,
+                     due_date=excluded.due_date,is_deleted=0,deleted_at=NULL,
+                     status=CASE WHEN tasks.status='已完成' THEN tasks.status ELSE excluded.status END,
+                     updated_at=CURRENT_TIMESTAMP""",
+                (case["person_id"], case.get("quota_id"), case["id"], task_title, due_value, task_key),
+            )
+        if emitted and case.get("renewal_alert_status") == "pending":
+            db.execute(
+                "UPDATE person_cases SET renewal_alert_status='reminded',updated_at=CURRENT_TIMESTAMP WHERE id=?",
+                (case["id"],),
+            )
+    db.commit()
+
+
 def create_workflow_record(db, person_id, quota_id, workflow_name):
     contract = db.execute(
         """SELECT status FROM contracts WHERE person_id=? AND quota_id=? AND is_deleted=0
@@ -2097,6 +2209,7 @@ def index(default_view="overview"):
     all_quota_views = build_quota_views(db, all_quota_rows)
     generate_lifecycle_nodes(db)
     refresh_risks(db, all_quota_views)
+    refresh_person_case_alerts(db)
 
     events = db.execute(
         """
@@ -2183,10 +2296,13 @@ def index(default_view="overview"):
     ).fetchall()
     risks = db.execute(
         """
-        SELECT r.*, p.name AS person_name, q.quota_number
+        SELECT r.*, p.name AS person_name, p.company_name, q.quota_number,
+               pc.case_label,
+               CAST(julianday(r.due_date)-julianday(date('now','localtime')) AS INTEGER) AS remaining_days
         FROM risks r
         LEFT JOIN people p ON p.id=r.person_id AND p.is_deleted=0
         LEFT JOIN quotas q ON q.id=r.quota_id AND q.is_deleted=0
+        LEFT JOIN person_cases pc ON pc.id=r.person_case_id AND pc.is_deleted=0
         WHERE r.is_deleted=0
         ORDER BY CASE r.risk_level WHEN '高' THEN 0 WHEN '中' THEN 1 ELSE 2 END,
                  r.id DESC
@@ -2194,11 +2310,13 @@ def index(default_view="overview"):
     ).fetchall()
     tasks = db.execute(
         """
-        SELECT t.*, p.name AS person_name, q.quota_number, w.workflow_code
+        SELECT t.*, p.name AS person_name, q.quota_number, w.workflow_code,
+               pc.case_label
         FROM tasks t
         JOIN people p ON p.id=t.person_id AND p.is_deleted=0
         LEFT JOIN quotas q ON q.id=t.quota_id AND q.is_deleted=0
         LEFT JOIN workflow_instances w ON w.id=t.workflow_id AND w.is_deleted=0
+        LEFT JOIN person_cases pc ON pc.id=t.person_case_id AND pc.is_deleted=0
         WHERE t.is_deleted=0
         ORDER BY CASE t.status WHEN '逾期' THEN 0 WHEN '待办' THEN 1
                               WHEN '进行中' THEN 2 ELSE 3 END, t.due_date
@@ -2640,17 +2758,61 @@ def create_person_case(person_id):
     if case_type not in {"new_contract", "renewal", "replacement", "other"} or status not in {"active", "completed", "archived"} or not case_label:
         flash("办理周期类型、名称或状态无效。", "error")
         return redirect(url_for("person_detail", person_id=person_id))
+    contract_start_date = request.form.get("contract_start_date") or request.form.get("start_date") or None
+    contract_end_date = request.form.get("contract_end_date") or request.form.get("end_date") or None
+    endorsement_expiry_date = request.form.get("endorsement_expiry_date") or None
+    calculated = calculate_renewal_alert_dates({
+        "contract_end_date": contract_end_date,
+        "endorsement_expiry_date": endorsement_expiry_date,
+    })
     db.execute(
         """INSERT INTO person_cases
-           (person_id,case_type,case_label,start_date,end_date,quota_id,contract_id,status,remarks)
-           VALUES (?,?,?,?,?,?,?,?,?)""",
+           (person_id,case_type,case_label,start_date,end_date,contract_start_date,
+            contract_end_date,contract_restart_due_date,endorsement_expiry_date,
+            document_collection_due_date,quota_id,contract_id,status,remarks)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (person_id, case_type, case_label,
          request.form.get("start_date") or None, request.form.get("end_date") or None,
+         contract_start_date, contract_end_date, calculated["contract_restart_due_date"],
+         endorsement_expiry_date, calculated["document_collection_due_date"],
          request.form.get("quota_id") or None, request.form.get("contract_id") or None,
          status, request.form.get("remarks") or None),
     )
     db.commit()
     flash("办理周期已创建。", "success")
+    return redirect(url_for("person_detail", person_id=person_id))
+
+
+@app.post("/people/<int:person_id>/cases/<int:case_id>/renewal-alerts")
+def update_person_case_renewal_alerts(person_id, case_id):
+    db = get_db()
+    person_case = db.execute(
+        "SELECT * FROM person_cases WHERE id=? AND person_id=? AND is_deleted=0",
+        (case_id, person_id),
+    ).fetchone()
+    if not person_case:
+        abort(404)
+    alert_status = request.form.get("renewal_alert_status", "pending")
+    if alert_status not in {"pending", "reminded", "completed", "ignored"}:
+        alert_status = "pending"
+    values = {
+        "contract_start_date": request.form.get("contract_start_date") or None,
+        "contract_end_date": request.form.get("contract_end_date") or None,
+        "endorsement_expiry_date": request.form.get("endorsement_expiry_date") or None,
+    }
+    calculated = calculate_renewal_alert_dates(values)
+    db.execute(
+        """UPDATE person_cases SET contract_start_date=?,contract_end_date=?,
+                  contract_restart_due_date=?,endorsement_expiry_date=?,
+                  document_collection_due_date=?,renewal_alert_status=?,
+                  updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+        (values["contract_start_date"], values["contract_end_date"],
+         calculated["contract_restart_due_date"], values["endorsement_expiry_date"],
+         calculated["document_collection_due_date"], alert_status, case_id),
+    )
+    db.commit()
+    refresh_person_case_alerts(db)
+    flash("续约提醒日期已保存。", "success")
     return redirect(url_for("person_detail", person_id=person_id))
 
 
