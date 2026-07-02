@@ -27,7 +27,7 @@ from app.services.person_profile_service import (
     DOCUMENT_TYPES, HUMAN_REVIEW_STATUS, calculate_renewal_alert_dates,
     get_person_profile, save_person_document_batch,
     document_hash_from_path, find_duplicate_document, queue_conflict, queue_retry,
-    suggest_case_for_document, suggest_person_by_filename,
+    search_people_for_binding, suggest_case_for_document, suggest_person_by_filename,
 )
 
 
@@ -4091,6 +4091,48 @@ def view_person_document(document_id):
 def suggest_person_document_owner():
     filename = request.args.get("filename", "")[:255]
     return api_response(0, "ok", suggest_person_by_filename(get_db(), filename))
+
+
+@app.get("/api/people/search")
+def search_people_api():
+    keyword = request.args.get("q", "")[:80]
+    return api_response(0, "ok", search_people_for_binding(get_db(), keyword))
+
+
+@app.post("/api/people/quick-create")
+def quick_create_person_api():
+    payload = request.get_json(silent=True) or {}
+    name = str(payload.get("name") or "").strip()
+    gender = str(payload.get("gender") or "").strip()
+    company_name = str(payload.get("company_name") or "").strip() or None
+    if not name:
+        return api_response(400, "请填写人员姓名", None, 400)
+    if gender not in {"男", "女"}:
+        return api_response(400, "请选择性别", None, 400)
+    db = get_db()
+    existing = db.execute(
+        "SELECT id,name,company_name FROM people WHERE is_deleted=0 AND name=? AND COALESCE(company_name,'')=COALESCE(?,'')",
+        (name, company_name),
+    ).fetchall()
+    if existing:
+        return api_response(409, "存在同名同公司人员，请从候选列表确认", [dict(row) for row in existing], 409)
+    cursor = db.execute(
+        """INSERT INTO people
+           (name,person_name,gender,company_name,worker_type,data_source,data_precedence_rank)
+           VALUES (?,?,?,?, 'new','manual_input',1)""",
+        (name, name, gender, company_name),
+    )
+    person_id = cursor.lastrowid
+    db.execute(
+        """INSERT INTO events(person_id,event_type,note,event_date,created_at)
+           VALUES (?,'登记','通过资料绑定新增人员',?,?)""",
+        (person_id, date.today().isoformat(), datetime.now().strftime("%Y-%m-%d %H:%M")),
+    )
+    db.commit()
+    return api_response(0, "人员已创建", {
+        "id": person_id, "name": name, "company_name": company_name,
+        "worker_type": "new", "recent_contract": None,
+    }, 201)
 
 
 @app.post("/person-documents/upload-batch")

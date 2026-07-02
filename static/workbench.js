@@ -112,59 +112,154 @@
     });
   });
 
-  const documentFile = document.querySelector('[data-person-document-file]');
-  const documentPerson = document.querySelector('[data-person-document-person]');
-  const documentSuggestion = document.querySelector('[data-person-document-suggestion]');
-  documentFile?.addEventListener('change', () => {
-    const filename = documentFile.files?.[0]?.name || '';
-    const matches = Array.from(documentPerson?.options || []).filter(
-      (option) => option.dataset.personName && filename.includes(option.dataset.personName),
-    );
-    if (matches.length === 1) {
-      documentPerson.value = matches[0].value;
-      documentSuggestion.textContent = `已按文件名推荐绑定：${matches[0].dataset.personName}`;
-      documentSuggestion.hidden = false;
-    } else if (documentSuggestion) {
-      documentSuggestion.hidden = true;
-    }
-  });
+  const personLabel = (person) => `${person.name} · ${person.company_name || '公司待补充'}`;
+  const initializePersonBinding = (binding) => {
+    const input = binding.querySelector('[data-person-search]');
+    const personId = binding.querySelector('[data-person-id]');
+    const candidates = binding.querySelector('[data-person-candidates]');
+    const selected = binding.querySelector('[data-selected-person]');
+    const fallback = binding.querySelector('[data-person-fallback]');
+    const message = binding.querySelector('[data-person-binding-message]');
+    const createPanel = binding.querySelector('[data-quick-person-create]');
+    let timer;
+
+    const bindPerson = (person, source = '人工确认') => {
+      personId.value = person.id;
+      input.value = person.name;
+      input.setCustomValidity('');
+      selected.textContent = `已绑定：${personLabel(person)}${person.recent_contract ? ` · 最近合同 ${person.recent_contract}` : ''}`;
+      selected.hidden = false;
+      candidates.hidden = true;
+      message.textContent = source;
+      message.hidden = false;
+      fallback.value = String(person.id);
+      binding.dispatchEvent(new CustomEvent('person-bound', {detail: person}));
+    };
+
+    const renderCandidates = (people, heading = '') => {
+      candidates.replaceChildren();
+      if (heading) {
+        const title = document.createElement('strong');
+        title.className = 'candidate-heading';
+        title.textContent = heading;
+        candidates.append(title);
+      }
+      people.forEach((person) => {
+        const button = document.createElement('button');
+        button.type = 'button';
+        button.className = 'person-candidate';
+        button.innerHTML = `<strong>${escape(person.name)}</strong><span>${escape(person.company_name || '公司待补充')}</span><small>${escape(person.recent_contract ? `最近合同：${person.recent_contract}` : '暂无合同')}</small>`;
+        button.addEventListener('click', () => bindPerson(person));
+        candidates.append(button);
+      });
+      candidates.hidden = people.length === 0;
+    };
+
+    const search = async (keyword) => {
+      if (!keyword.trim()) {
+        candidates.hidden = true;
+        return;
+      }
+      try {
+        renderCandidates(await window.labourApi.request(`/api/people/search?q=${encodeURIComponent(keyword)}`));
+      } catch (error) {
+        message.textContent = error.message || '人员搜索失败';
+        message.hidden = false;
+      }
+    };
+
+    input.addEventListener('input', () => {
+      personId.value = '';
+      selected.hidden = true;
+      clearTimeout(timer);
+      timer = setTimeout(() => search(input.value), 180);
+    });
+    fallback.addEventListener('change', () => {
+      const option = fallback.options[fallback.selectedIndex];
+      if (option.value) bindPerson({id: option.value, name: option.dataset.name, company_name: option.dataset.company});
+    });
+    binding.querySelector('[data-create-person]').addEventListener('click', () => {
+      createPanel.hidden = !createPanel.hidden;
+      if (!createPanel.hidden) createPanel.querySelector('[data-new-person-name]').value = input.value.trim();
+    });
+    binding.querySelector('[data-confirm-create-person]').addEventListener('click', async () => {
+      const name = createPanel.querySelector('[data-new-person-name]').value.trim();
+      const gender = createPanel.querySelector('[data-new-person-gender]').value;
+      const company_name = createPanel.querySelector('[data-new-person-company]').value.trim();
+      if (!window.confirm(`确认创建新人员“${name || '未填写'}”并绑定当前资料？`)) return;
+      try {
+        const person = await window.labourApi.request('/api/people/quick-create', {
+          method: 'POST', body: JSON.stringify({name, gender, company_name}),
+        });
+        const option = new Option(personLabel(person), person.id);
+        option.dataset.name = person.name;
+        option.dataset.company = person.company_name || '';
+        fallback.add(option);
+        bindPerson(person, '新人员已创建并绑定');
+        createPanel.hidden = true;
+      } catch (error) {
+        message.textContent = error.message || '创建人员失败';
+        message.hidden = false;
+      }
+    });
+
+    const autoMatch = async () => {
+      const filenames = Array.from(binding.closest('form').querySelectorAll('[data-smart-person-file]'))
+        .flatMap((fileInput) => Array.from(fileInput.files || []).map((file) => file.webkitRelativePath || file.name));
+      const metadata = Array.from(binding.closest('form').querySelectorAll('[data-smart-person-metadata]'))
+        .map((field) => field.value).join(' ');
+      const clue = `${filenames.join(' ')} ${metadata}`.trim();
+      if (!clue) return;
+      const matches = await window.labourApi.request(`/api/person-documents/suggest?filename=${encodeURIComponent(clue)}`);
+      if (matches.length === 1) {
+        bindPerson(matches[0], '已根据文件名 / metadata 唯一匹配并自动绑定');
+      } else if (matches.length > 1) {
+        personId.value = '';
+        renderCandidates(matches, '匹配到多个人员，请人工确认');
+        message.textContent = '存在多人匹配，确认候选后才能上传。';
+        message.hidden = false;
+      } else {
+        message.textContent = '未自动识别人员，请输入关键词搜索、从名单选择或创建新人员。';
+        message.hidden = false;
+      }
+    };
+    binding.closest('form').querySelectorAll('[data-smart-person-file], [data-smart-person-metadata]')
+      .forEach((field) => field.addEventListener('change', autoMatch));
+    binding.closest('form').addEventListener('submit', (event) => {
+      if (!personId.value) {
+        event.preventDefault();
+        input.setCustomValidity('请确认绑定人员后再上传');
+        input.reportValidity();
+      }
+    });
+    return {personId, fallback, bindPerson};
+  };
+
+  document.querySelectorAll('[data-smart-person-binding]').forEach(initializePersonBinding);
 
   document.querySelectorAll('[data-batch-upload]').forEach((form) => {
     const inputs = Array.from(form.querySelectorAll('input[type="file"][name="files"]'));
     const countLabel = form.querySelector('[data-upload-file-count]');
-    const personSelect = form.querySelector('[data-batch-person]');
+    const binding = form.querySelector('[data-smart-person-binding]');
+    const personId = binding?.querySelector('[data-person-id]');
     const caseSelect = form.querySelector('[data-batch-case]');
     const suggestion = form.querySelector('[data-batch-suggestion]');
     const files = () => inputs.flatMap((input) => Array.from(input.files || []));
     const refresh = () => {
       const selected = files();
       if (countLabel) countLabel.textContent = selected.length ? `已选择 ${selected.length} 个文件` : '尚未选择文件';
-      if (!personSelect || !suggestion) return;
-      const options = Array.from(personSelect.options).filter((option) => option.dataset.personName);
-      const matches = options.filter((option) => selected.some((file) => file.name.includes(option.dataset.personName)));
-      if (matches.length === 1) {
-        personSelect.value = matches[0].value;
-        refreshCases();
-        suggestion.textContent = `已按文件名推荐：${matches[0].dataset.personName}`;
-        suggestion.hidden = false;
-      } else if (matches.length > 1) {
-        personSelect.value = '';
-        suggestion.textContent = `匹配到多个候选：${matches.map((item) => item.dataset.personName).join('、')}，请人工选择。`;
-        suggestion.hidden = false;
-      } else {
-        suggestion.hidden = true;
-      }
+      refreshCases();
     };
     inputs.forEach((input) => input.addEventListener('change', refresh));
     const refreshCases = () => {
-      if (!personSelect || !caseSelect) return;
+      if (!personId || !caseSelect) return;
       caseSelect.value = '';
       Array.from(caseSelect.options).forEach((option) => {
         if (!option.dataset.personId) return;
-        option.hidden = option.dataset.personId !== personSelect.value;
+        option.hidden = option.dataset.personId !== personId.value;
       });
     };
-    personSelect?.addEventListener('change', refreshCases);
+    binding?.addEventListener('person-bound', refreshCases);
     refreshCases();
     form.addEventListener('submit', (event) => {
       const selected = files();
@@ -174,12 +269,12 @@
         window.alert(!selected.length ? '请至少选择一个文件。' : selected.length > 50 ? '单次最多上传50个文件。' : `${oversized.name} 超过25MB。`);
         return;
       }
-      if (personSelect) {
-        const person = personSelect.options[personSelect.selectedIndex];
-        const visibleCases = Array.from(caseSelect?.options || []).filter((option) => option.dataset.personId === personSelect.value);
+      if (personId?.value) {
+        const selectedPerson = binding.querySelector('[data-selected-person]').textContent;
+        const visibleCases = Array.from(caseSelect?.options || []).filter((option) => option.dataset.personId === personId.value);
         if (visibleCases.length > 1 || !caseSelect?.value) {
           const selectedCase = caseSelect?.value ? caseSelect.options[caseSelect.selectedIndex].textContent : '暂不绑定 / 系统建议';
-          const confirmed = window.confirm(`请二次确认资料归档：\n人员：${person.dataset.personName}\n公司：${person.dataset.company || '待补充'}\n人员类型：${person.dataset.workerType === 'renewal' ? '续约' : '新人'}\n入境签证号：${person.dataset.entryPermit || '待补充'}\n办理周期：${selectedCase}\nVISA状态：${person.dataset.visaStatus || '未出'}\n\n确认继续上传？`);
+          const confirmed = window.confirm(`请二次确认资料归档：\n${selectedPerson}\n办理周期：${selectedCase}\n\n确认继续上传？`);
           if (!confirmed) event.preventDefault();
         }
       }

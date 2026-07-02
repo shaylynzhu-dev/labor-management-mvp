@@ -7,7 +7,7 @@ from app import app, get_db, init_db
 from app.services.person_profile_service import (
     calculate_renewal_alert_dates, check_hk_id_appointment_ready, get_entry_visa_query_key,
     get_missing_documents, get_person_profile, suggest_person_by_filename,
-    save_person_document_batch, suggest_case_for_document,
+    save_person_document_batch, search_people_for_binding, suggest_case_for_document,
 )
 
 
@@ -130,6 +130,23 @@ class PersonProfileTest(unittest.TestCase):
                 (row["person_case_id"], row["case_binding_status"]),
                 (case_id, "confirmed"),
             )
+
+    def test_smart_binding_search_includes_recent_contract(self):
+        with app.app_context():
+            db = get_db()
+            person_id = db.execute(
+                "INSERT INTO people(name,person_name,gender,company_name) VALUES ('陈小明','陈小明','男','安康公司')"
+            ).lastrowid
+            db.execute(
+                """INSERT INTO contracts
+                   (contract_id,person_name,company,status,person_id)
+                   VALUES ('C-SMART-001','陈小明','安康公司','制作合同',?)""",
+                (person_id,),
+            )
+            db.commit()
+            matches = search_people_for_binding(db, "C-SMART")
+            self.assertEqual(matches[0]["id"], person_id)
+            self.assertEqual(matches[0]["recent_contract"], "C-SMART-001")
 
     def test_batch_upload_duplicate_and_unclassified_go_to_control_queues(self):
         with app.app_context():

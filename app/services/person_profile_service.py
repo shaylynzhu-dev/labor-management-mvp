@@ -9,6 +9,11 @@ import uuid
 
 from werkzeug.utils import secure_filename
 
+try:
+    from pypinyin import lazy_pinyin
+except ImportError:  # Production installs pypinyin; keep local startup tolerant.
+    lazy_pinyin = None
+
 
 DOCUMENT_TYPES = {
     "resume": "简历",
@@ -95,11 +100,41 @@ def suggest_person_by_filename(db, filename):
         return []
     candidates = []
     for row in db.execute(
-        "SELECT id,name,company_name FROM people WHERE is_deleted=0 ORDER BY length(name) DESC,id"
+        """SELECT p.id,p.name,p.company_name,p.worker_type,p.entry_permit_no,p.visa_status,
+                  (SELECT c.contract_id FROM contracts c
+                   WHERE c.person_id=p.id AND c.is_deleted=0
+                   ORDER BY c.created_at DESC,c.id DESC LIMIT 1) AS recent_contract
+           FROM people p WHERE p.is_deleted=0 ORDER BY length(p.name) DESC,p.id"""
     ).fetchall():
         if row["name"] and row["name"].casefold() in filename:
             candidates.append(dict(row))
     return candidates
+
+
+def search_people_for_binding(db, keyword, limit=12):
+    """Return binding candidates, including name/company/pinyin and recent contract."""
+    keyword = (keyword or "").strip().casefold()
+    rows = db.execute(
+        """SELECT p.id,p.name,p.company_name,p.worker_type,p.entry_permit_no,p.visa_status,
+                  (SELECT c.contract_id FROM contracts c
+                   WHERE c.person_id=p.id AND c.is_deleted=0
+                   ORDER BY c.created_at DESC,c.id DESC LIMIT 1) AS recent_contract
+           FROM people p WHERE p.is_deleted=0 ORDER BY p.id DESC"""
+    ).fetchall()
+    matches = []
+    for row in rows:
+        item = dict(row)
+        searchable = " ".join(
+            str(item.get(field) or "") for field in ("name", "company_name", "recent_contract")
+        ).casefold()
+        if lazy_pinyin and item.get("name"):
+            syllables = lazy_pinyin(item["name"])
+            searchable += " " + "".join(syllables).casefold() + " " + " ".join(syllables).casefold()
+        if not keyword or keyword in searchable:
+            matches.append(item)
+        if len(matches) >= limit:
+            break
+    return matches
 
 
 def data_precedence_rank(source):
