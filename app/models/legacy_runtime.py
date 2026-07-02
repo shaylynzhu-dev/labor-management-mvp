@@ -31,7 +31,8 @@ from app.services.person_profile_service import (
 )
 from app.services.person_system_service import (
     DOCUMENT_BINDING_RULE_VERSION, EVENT_ENGINE_RULE_VERSION, PERSON_KEY_RULE_VERSION,
-    backfill_person_global_keys, refresh_person_events, sqlite_person_global_key,
+    backfill_person_global_keys, find_duplicate_people, process_person_events,
+    refresh_person_events, sqlite_person_global_key,
 )
 
 
@@ -1035,7 +1036,9 @@ def init_db():
             data_source TEXT NOT NULL DEFAULT 'auto_inference',
             data_precedence_rank INTEGER NOT NULL DEFAULT 6,
             person_global_key TEXT,
-            binding_rule_version TEXT NOT NULL DEFAULT 'document-binding-v1',
+            binding_rule_version TEXT NOT NULL DEFAULT 'document-binding-v2',
+            person_binding_source TEXT NOT NULL DEFAULT 'auto_inference',
+            person_binding_confidence REAL NOT NULL DEFAULT 0,
             import_batch_version TEXT,
             ocr_text TEXT NOT NULL DEFAULT '',
             issue_date TEXT,
@@ -1291,6 +1294,8 @@ def init_db():
         "data_source": "TEXT NOT NULL DEFAULT 'auto_inference'",
         "data_precedence_rank": "INTEGER NOT NULL DEFAULT 6",
         "person_global_key": "TEXT", "binding_rule_version": "TEXT",
+        "person_binding_source": "TEXT NOT NULL DEFAULT 'auto_inference'",
+        "person_binding_confidence": "REAL NOT NULL DEFAULT 0",
         "import_batch_version": "TEXT",
     }.items():
         if column not in person_document_columns:
@@ -1389,7 +1394,7 @@ def init_db():
             trigger_date TEXT NOT NULL,
             due_date TEXT,
             status TEXT NOT NULL DEFAULT 'pending'
-                CHECK(status IN ('pending','completed','overdue')),
+                CHECK(status IN ('pending','due','completed','overdue')),
             source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
             source_ref TEXT NOT NULL UNIQUE,
             rule_version TEXT NOT NULL,
@@ -1413,6 +1418,46 @@ def init_db():
             ("person_event_engine", EVENT_ENGINE_RULE_VERSION, "人员事件自动生成规则"),
         ),
     )
+    db.execute(
+        """UPDATE rule_versions SET is_active=CASE
+             WHEN version IN (?,?,?) THEN 1 ELSE 0 END""",
+        (PERSON_KEY_RULE_VERSION, DOCUMENT_BINDING_RULE_VERSION, EVENT_ENGINE_RULE_VERSION),
+    )
+    person_events_sql = db.execute(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='person_events'"
+    ).fetchone()["sql"]
+    if "'due'" not in person_events_sql:
+        db.executescript(
+            """BEGIN IMMEDIATE;
+            ALTER TABLE person_events RENAME TO person_events_status_legacy;
+            CREATE TABLE person_events (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                person_global_key TEXT NOT NULL,
+                event_type TEXT NOT NULL CHECK(event_type IN
+                    ('contract_renewal','visa_submission','permit_expiry','document_missing')),
+                trigger_date TEXT NOT NULL,
+                due_date TEXT,
+                status TEXT NOT NULL DEFAULT 'pending'
+                    CHECK(status IN ('pending','due','completed','overdue')),
+                source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
+                source_ref TEXT NOT NULL UNIQUE,
+                rule_version TEXT NOT NULL,
+                created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+            );
+            INSERT INTO person_events
+                (id,person_global_key,event_type,trigger_date,due_date,status,source,
+                 source_ref,rule_version,created_at,updated_at)
+            SELECT id,person_global_key,event_type,trigger_date,due_date,status,source,
+                   source_ref,rule_version,created_at,updated_at
+            FROM person_events_status_legacy;
+            DROP TABLE person_events_status_legacy;
+            CREATE INDEX IF NOT EXISTS idx_person_events_due
+                ON person_events(status,trigger_date,due_date);
+            CREATE INDEX IF NOT EXISTS idx_person_events_key
+                ON person_events(person_global_key,event_type);
+            COMMIT;"""
+        )
     db.executemany(
         "INSERT OR IGNORE INTO data_precedence_rules(source,rank,label) VALUES (?,?,?)",
         (
@@ -1467,6 +1512,15 @@ def init_db():
         "CREATE INDEX IF NOT EXISTS idx_person_documents_global_key ON person_documents(person_global_key,is_deleted)"
     )
     db.executescript(
+        """DROP TRIGGER IF EXISTS trg_people_global_key_insert;
+        DROP TRIGGER IF EXISTS trg_person_documents_global_key_insert;
+        DROP TRIGGER IF EXISTS trg_person_documents_global_key_rebind;
+        DROP TRIGGER IF EXISTS trg_people_change_insert;
+        DROP TRIGGER IF EXISTS trg_people_change_update;
+        DROP TRIGGER IF EXISTS trg_document_binding_change_insert;
+        DROP TRIGGER IF EXISTS trg_document_binding_change_update;"""
+    )
+    db.executescript(
         f"""
         CREATE TRIGGER IF NOT EXISTS trg_people_global_key_insert
         AFTER INSERT ON people
@@ -1492,8 +1546,9 @@ def init_db():
              import_batch_version,rule_version)
           SELECT person_global_key,'bind','person_document',CAST(id AS TEXT),
             json_object('person_id',person_id,'person_case_id',person_case_id,
-              'binding_source',binding_source,'filename',original_filename),
-            COALESCE(binding_source,'auto_inference'),import_batch_version,
+              'binding_source',person_binding_source,'confidence',person_binding_confidence,
+              'filename',original_filename),
+            COALESCE(person_binding_source,'auto_inference'),import_batch_version,
             COALESCE(binding_rule_version,'{DOCUMENT_BINDING_RULE_VERSION}')
           FROM person_documents WHERE id=NEW.id;
         END;
@@ -1574,8 +1629,9 @@ def init_db():
              import_batch_version,rule_version)
           SELECT person_global_key,'bind','person_document',CAST(id AS TEXT),
             json_object('person_id',person_id,'person_case_id',person_case_id,
-              'binding_source',binding_source,'filename',original_filename),
-            COALESCE(binding_source,'auto_inference'),import_batch_version,
+              'binding_source',person_binding_source,'confidence',person_binding_confidence,
+              'filename',original_filename),
+            COALESCE(person_binding_source,'auto_inference'),import_batch_version,
             COALESCE(binding_rule_version,'{DOCUMENT_BINDING_RULE_VERSION}')
           FROM person_documents WHERE id=NEW.id;
         END;
@@ -1593,7 +1649,7 @@ def init_db():
               'binding_status',OLD.case_binding_status),
             json_object('person_id',NEW.person_id,'person_case_id',NEW.person_case_id,
               'binding_status',NEW.case_binding_status),
-            COALESCE(NEW.binding_source,'manual_input'),NEW.import_batch_version,
+            COALESCE(NEW.person_binding_source,'manual_override'),NEW.import_batch_version,
             COALESCE(NEW.binding_rule_version,'{DOCUMENT_BINDING_RULE_VERSION}'));
         END;
         """
@@ -1757,6 +1813,12 @@ def init_db():
 def init_db_command():
     init_db()
     print("数据库已初始化。")
+
+
+@app.cli.command("process-person-events")
+def process_person_events_command():
+    result = process_person_events(get_db())
+    print(json.dumps(result, ensure_ascii=False))
 
 
 def four_digits(value):
@@ -4258,6 +4320,12 @@ def upload_document():
     document_hash = document_hash_from_path(path)
     duplicate = find_duplicate_document(db, document_hash, original_filename, person_id, None)
     version_no = int(duplicate["version_no"] or 1) + 1 if duplicate else 1
+    try:
+        person_binding_confidence = min(
+            1.0, max(0.0, float(request.form.get("person_binding_confidence") or 1.0))
+        )
+    except (TypeError, ValueError):
+        person_binding_confidence = 0.0
     if manual_text:
         ocr_text, ocr_status = manual_text, "人工补录"
     else:
@@ -4270,12 +4338,15 @@ def upload_document():
         """INSERT INTO person_documents
            (person_id,document_type,original_filename,stored_path,ocr_text,
             issue_date,expiry_date,status,remarks,document_hash,duplicate_of_document_id,
-            version_no,binding_source,data_source,data_precedence_rank)
-           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+            version_no,binding_source,data_source,data_precedence_rank,
+            person_binding_source,person_binding_confidence)
+           VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
         (person_id, document_type, original_filename, stored_name, ocr_text, issue_date,
          expiry_date, "duplicate" if duplicate else ("pending_ocr" if ocr_status == "待OCR" else HUMAN_REVIEW_STATUS),
          remarks, document_hash, duplicate["id"] if duplicate else None, version_no,
-         "manual_input", "manual_input", 1),
+         "manual_input", "manual_input", 1,
+         request.form.get("person_binding_source") or "manual_input",
+         person_binding_confidence),
     )
     if quota_id and workflow_id:
         valid_quota = db.execute(
@@ -4338,23 +4409,64 @@ def search_people_api():
     return api_response(0, "ok", search_people_for_binding(get_db(), keyword))
 
 
+@app.get("/api/people/duplicate-suggestions")
+def duplicate_people_api():
+    candidate = {
+        "name": request.args.get("name", "")[:100],
+        "birth_date": request.args.get("birth_date", "")[:10],
+        "mainland_id_last4": request.args.get("mainland_id_last4", "")[:4],
+        "hkmo_permit_first4": request.args.get("hkmo_permit_first4", "")[:4],
+        "hkmo_permit_last6": request.args.get("hkmo_permit_last6", "")[:6],
+    }
+    return api_response(0, "ok", find_duplicate_people(get_db(), candidate))
+
+
+@app.patch("/api/person-events/<int:event_id>/complete")
+def complete_person_event_api(event_id):
+    db = get_db()
+    cursor = db.execute(
+        """UPDATE person_events SET status='completed',updated_at=CURRENT_TIMESTAMP
+           WHERE id=?""",
+        (event_id,),
+    )
+    if cursor.rowcount == 0:
+        return api_response(404, "人员事件不存在", None, 404)
+    db.commit()
+    return api_response(0, "事件已完成", {"id": event_id, "status": "completed"})
+
+
 @app.post("/api/people/quick-create")
 def quick_create_person_api():
     payload = request.get_json(silent=True) or {}
     name = str(payload.get("name") or "").strip()
     gender = str(payload.get("gender") or "").strip()
     company_name = str(payload.get("company_name") or "").strip() or None
+    allow_duplicate = payload.get("allow_duplicate") is True
     if not name:
         return api_response(400, "请填写人员姓名", None, 400)
     if gender not in {"男", "女"}:
         return api_response(400, "请选择性别", None, 400)
     db = get_db()
-    existing = db.execute(
-        "SELECT id,name,company_name FROM people WHERE is_deleted=0 AND name=? AND COALESCE(company_name,'')=COALESCE(?,'')",
-        (name, company_name),
-    ).fetchall()
-    if existing:
-        return api_response(409, "存在同名同公司人员，请从候选列表确认", [dict(row) for row in existing], 409)
+    duplicate_suggestions = find_duplicate_people(db, {
+        "name": name, "company_name": company_name,
+        "birth_date": payload.get("birth_date"),
+        "mainland_id_last4": payload.get("mainland_id_last4"),
+        "hkmo_permit_first4": payload.get("hkmo_permit_first4"),
+        "hkmo_permit_last6": payload.get("hkmo_permit_last6"),
+    })
+    if duplicate_suggestions and not allow_duplicate:
+        queue_conflict(
+            db, "suspected_duplicate_person", "person", {
+                "candidate": {"name": name, "company_name": company_name},
+                "suggestions": duplicate_suggestions,
+                "merge_action": "manual_review_only",
+            }, source="manual_input",
+        )
+        db.commit()
+        return api_response(
+            409, "发现疑似重复人员，请确认候选；系统不会自动合并",
+            duplicate_suggestions, 409,
+        )
     cursor = db.execute(
         """INSERT INTO people
            (name,person_name,gender,company_name,worker_type,data_source,data_precedence_rank)
@@ -4367,6 +4479,19 @@ def quick_create_person_api():
            VALUES (?,'登记','通过资料绑定新增人员',?,?)""",
         (person_id, date.today().isoformat(), datetime.now().strftime("%Y-%m-%d %H:%M")),
     )
+    if duplicate_suggestions and allow_duplicate:
+        person_key = db.execute(
+            "SELECT person_global_key FROM people WHERE id=?", (person_id,)
+        ).fetchone()["person_global_key"]
+        db.execute(
+            """INSERT INTO person_change_log
+               (person_global_key,action,entity_type,entity_id,new_data,source,rule_version)
+               VALUES (?,'manual_override','person',?,?,'manual_input',?)""",
+            (person_key, str(person_id), json.dumps({
+                "reason": "duplicate_suggestion_overridden",
+                "candidate_ids": [item["id"] for item in duplicate_suggestions],
+            }, ensure_ascii=False), PERSON_KEY_RULE_VERSION),
+        )
     db.commit()
     return api_response(0, "人员已创建", {
         "id": person_id, "name": name, "company_name": company_name,
@@ -4386,6 +4511,8 @@ def upload_person_document_batch():
             request.form.get("document_type", "unknown"),
             (request.form.get("remarks") or "").strip() or None,
             request.form.get("person_case_id") or None,
+            request.form.get("person_binding_source") or "manual_input",
+            request.form.get("person_binding_confidence") or 1.0,
         )
         session["person_document_upload_result"] = result
         flash(

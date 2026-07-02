@@ -1,15 +1,19 @@
 from datetime import date, datetime, timedelta
+from difflib import SequenceMatcher
 import hashlib
+import re
+import unicodedata
 import uuid
 
 
-PERSON_KEY_RULE_VERSION = "person-global-key-v1"
-DOCUMENT_BINDING_RULE_VERSION = "document-binding-v1"
-EVENT_ENGINE_RULE_VERSION = "person-event-engine-v1"
+PERSON_KEY_RULE_VERSION = "person-global-key-v2"
+DOCUMENT_BINDING_RULE_VERSION = "document-binding-v2"
+EVENT_ENGINE_RULE_VERSION = "person-event-engine-v2"
 
 
 def _clean(value):
-    return str(value or "").strip().casefold()
+    value = unicodedata.normalize("NFKC", str(value or "")).casefold()
+    return re.sub(r"[^0-9a-z\u3400-\u9fff]+", "", value)
 
 
 def generate_person_global_key(
@@ -71,10 +75,88 @@ def backfill_person_global_keys(db):
     )
 
 
-def _event_status(due_date, current_status=None):
+def find_duplicate_people(db, person, threshold=0.85, exclude_person_id=None):
+    """Return merge suggestions only; this function never mutates or merges records."""
+    candidate_name = _clean(person.get("name") or person.get("person_name"))
+    candidate_permit = _clean(
+        f"{person.get('hkmo_permit_first4') or ''}{person.get('hkmo_permit_last6') or ''}"
+    )
+    candidate_id_last4 = _clean(person.get("mainland_id_last4") or person.get("id_last4"))
+    candidate_birth = _clean(person.get("birth_date"))
+    suggestions = []
+    rows = db.execute(
+        """SELECT id,name,company_name,birth_date,mainland_id_last4,id_last4,
+                  hkmo_permit_first4,hkmo_permit_last6,person_global_key
+           FROM people WHERE is_deleted=0 AND (? IS NULL OR id!=?)""",
+        (exclude_person_id, exclude_person_id),
+    ).fetchall()
+    for row in rows:
+        existing = dict(row)
+        name_score = SequenceMatcher(None, candidate_name, _clean(existing["name"])).ratio()
+        existing_permit = _clean(
+            f"{existing.get('hkmo_permit_first4') or ''}{existing.get('hkmo_permit_last6') or ''}"
+        )
+        existing_last4 = _clean(existing.get("mainland_id_last4") or existing.get("id_last4"))
+        permit_match = bool(candidate_permit and existing_permit and candidate_permit == existing_permit)
+        id_match = bool(candidate_id_last4 and existing_last4 and candidate_id_last4 == existing_last4)
+        birth_match = bool(candidate_birth and _clean(existing.get("birth_date")) == candidate_birth)
+        confidence = name_score
+        reasons = ["姓名相似"] if name_score > threshold else []
+        if permit_match:
+            confidence = max(confidence, 0.96 if name_score > 0.6 else 0.9)
+            reasons.append("通行证一致")
+        if id_match:
+            confidence = max(confidence, 0.9 + min(name_score, 1.0) * 0.08)
+            reasons.append("身份证后四位一致")
+        if birth_match and name_score > 0.7:
+            confidence = max(confidence, 0.88 + name_score * 0.1)
+            reasons.append("出生日期一致")
+        if confidence > threshold:
+            suggestions.append({
+                "id": existing["id"], "name": existing["name"],
+                "company_name": existing.get("company_name"),
+                "person_global_key": existing.get("person_global_key"),
+                "confidence": round(min(confidence, 1.0), 4),
+                "reasons": reasons,
+                "merge_suggestion": "建议人工核对后选择保留主档案；系统不会自动合并。",
+            })
+    return sorted(suggestions, key=lambda item: item["confidence"], reverse=True)
+
+
+def _event_status(trigger_date, due_date, current_status=None, today=None):
     if current_status == "completed":
         return "completed"
-    return "overdue" if due_date < date.today().isoformat() else "pending"
+    today = (today or date.today()).isoformat()
+    if due_date and due_date < today:
+        return "overdue"
+    if trigger_date <= today:
+        return "due"
+    return "pending"
+
+
+def process_person_events(db, notification_hook=None, today=None):
+    """Daily worker pass. Hooks receive (event, old_status, new_status)."""
+    today = today or date.today()
+    changed = 0
+    scanned = 0
+    rows = db.execute("SELECT * FROM person_events ORDER BY id").fetchall()
+    for row in rows:
+        scanned += 1
+        event = dict(row)
+        new_status = _event_status(
+            event["trigger_date"], event.get("due_date"), event["status"], today,
+        )
+        if new_status == event["status"]:
+            continue
+        db.execute(
+            "UPDATE person_events SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
+            (new_status, event["id"]),
+        )
+        changed += 1
+        if notification_hook:
+            notification_hook(event, event["status"], new_status)
+    db.commit()
+    return {"scanned": scanned, "changed": changed, "run_date": today.isoformat()}
 
 
 def refresh_person_events(db):
@@ -105,7 +187,7 @@ def refresh_person_events(db):
                  status=CASE WHEN person_events.status='completed' THEN 'completed' ELSE excluded.status END,
                  rule_version=excluded.rule_version,updated_at=CURRENT_TIMESTAMP""",
             (row["person_global_key"], trigger, due.isoformat(),
-             _event_status(due.isoformat(), existing["status"] if existing else None),
+             _event_status(trigger, due.isoformat(), existing["status"] if existing else None),
              "contract", source_ref, EVENT_ENGINE_RULE_VERSION),
         )
 
@@ -136,7 +218,7 @@ def refresh_person_events(db):
                  status=CASE WHEN person_events.status='completed' THEN 'completed' ELSE excluded.status END,
                  rule_version=excluded.rule_version,updated_at=CURRENT_TIMESTAMP""",
             (row["person_global_key"], trigger, due.isoformat(),
-             _event_status(due.isoformat(), existing["status"] if existing else None),
+             _event_status(trigger, due.isoformat(), existing["status"] if existing else None),
              "visa", source_ref, EVENT_ENGINE_RULE_VERSION),
         )
     db.commit()

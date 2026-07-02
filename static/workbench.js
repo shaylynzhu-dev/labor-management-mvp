@@ -121,9 +121,23 @@
     const fallback = binding.querySelector('[data-person-fallback]');
     const message = binding.querySelector('[data-person-binding-message]');
     const createPanel = binding.querySelector('[data-quick-person-create]');
+    const form = binding.closest('form');
+    const hiddenField = (name, value = '') => {
+      let field = form.querySelector(`input[name="${name}"]`);
+      if (!field) {
+        field = document.createElement('input');
+        field.type = 'hidden';
+        field.name = name;
+        form.append(field);
+      }
+      if (!field.value) field.value = value;
+      return field;
+    };
+    const bindingSource = hiddenField('person_binding_source', 'manual_input');
+    const bindingConfidence = hiddenField('person_binding_confidence', '1');
     let timer;
 
-    const bindPerson = (person, source = '人工确认') => {
+    const bindPerson = (person, source = '人工确认', sourceCode = 'manual_override') => {
       personId.value = person.id;
       input.value = person.name;
       input.setCustomValidity('');
@@ -133,6 +147,8 @@
       message.textContent = source;
       message.hidden = false;
       fallback.value = String(person.id);
+      bindingSource.value = sourceCode;
+      bindingConfidence.value = String(person.confidence ?? (sourceCode === 'manual_override' ? 1 : 0));
       binding.dispatchEvent(new CustomEvent('person-bound', {detail: person}));
     };
 
@@ -148,8 +164,9 @@
         const button = document.createElement('button');
         button.type = 'button';
         button.className = 'person-candidate';
-        button.innerHTML = `<strong>${escape(person.name)}</strong><span>${escape(person.company_name || '公司待补充')}</span><small>${escape(person.recent_contract ? `最近合同：${person.recent_contract}` : '暂无合同')}</small>`;
-        button.addEventListener('click', () => bindPerson(person));
+        const confidence = Math.round(Number(person.confidence ?? 0) * 100);
+        button.innerHTML = `<strong>${escape(person.name)}</strong><span>${escape(person.company_name || '公司待补充')}</span><small>${escape(person.recent_contract ? `最近合同：${person.recent_contract}` : '暂无合同')} · 匹配度 ${confidence}%</small>`;
+        button.addEventListener('click', () => bindPerson(person, '已人工确认候选人员', 'manual_override'));
         candidates.append(button);
       });
       candidates.hidden = people.length === 0;
@@ -176,12 +193,15 @@
     });
     fallback.addEventListener('change', () => {
       const option = fallback.options[fallback.selectedIndex];
-      if (option.value) bindPerson({id: option.value, name: option.dataset.name, company_name: option.dataset.company});
+      if (option.value) bindPerson({id: option.value, name: option.dataset.name, company_name: option.dataset.company, confidence: 1}, '已从完整名单人工确认', 'manual_override');
     });
     binding.querySelector('[data-create-person]').addEventListener('click', () => {
       createPanel.hidden = !createPanel.hidden;
       if (!createPanel.hidden) createPanel.querySelector('[data-new-person-name]').value = input.value.trim();
     });
+    createPanel.querySelectorAll('input, select').forEach((field) => field.addEventListener('input', () => {
+      createPanel.dataset.allowDuplicate = 'false';
+    }));
     binding.querySelector('[data-confirm-create-person]').addEventListener('click', async () => {
       const name = createPanel.querySelector('[data-new-person-name]').value.trim();
       const gender = createPanel.querySelector('[data-new-person-gender]').value;
@@ -189,15 +209,22 @@
       if (!window.confirm(`确认创建新人员“${name || '未填写'}”并绑定当前资料？`)) return;
       try {
         const person = await window.labourApi.request('/api/people/quick-create', {
-          method: 'POST', body: JSON.stringify({name, gender, company_name}),
+          method: 'POST', body: JSON.stringify({
+            name, gender, company_name,
+            allow_duplicate: createPanel.dataset.allowDuplicate === 'true',
+          }),
         });
         const option = new Option(personLabel(person), person.id);
         option.dataset.name = person.name;
         option.dataset.company = person.company_name || '';
         fallback.add(option);
-        bindPerson(person, '新人员已创建并绑定');
+        bindPerson(person, '新人员已创建并绑定', 'manual_input');
         createPanel.hidden = true;
       } catch (error) {
+        if (Array.isArray(error.data) && error.data.length) {
+          renderCandidates(error.data, '发现疑似重复人员，请选择已有人员，或再次确认创建');
+          createPanel.dataset.allowDuplicate = 'true';
+        }
         message.textContent = error.message || '创建人员失败';
         message.hidden = false;
       }
@@ -212,7 +239,7 @@
       if (!clue) return;
       const matches = await window.labourApi.request(`/api/person-documents/suggest?filename=${encodeURIComponent(clue)}`);
       if (matches.length === 1) {
-        bindPerson(matches[0], '已根据文件名 / metadata 唯一匹配并自动绑定');
+        bindPerson(matches[0], '已根据文件名 / metadata 唯一匹配并自动绑定', 'filename_recognition');
       } else if (matches.length > 1) {
         personId.value = '';
         renderCandidates(matches, '匹配到多个人员，请人工确认');

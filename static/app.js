@@ -14,7 +14,10 @@ async function apiFetch(url, options = {}) {
   });
   const payload = await response.json();
   if (!response.ok || payload.code !== 0) {
-    throw new Error(payload.message || '请求失败');
+    const error = new Error(payload.message || '请求失败');
+    error.data = payload.data;
+    error.code = payload.code;
+    throw error;
   }
   return payload.data;
 }

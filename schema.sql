@@ -52,7 +52,9 @@ CREATE TABLE IF NOT EXISTS person_documents (
     data_source TEXT NOT NULL DEFAULT 'auto_inference',
     data_precedence_rank INTEGER NOT NULL DEFAULT 6,
     person_global_key TEXT NULL,
-    binding_rule_version TEXT NOT NULL DEFAULT 'document-binding-v1',
+    binding_rule_version TEXT NOT NULL DEFAULT 'document-binding-v2',
+    person_binding_source TEXT NOT NULL DEFAULT 'auto_inference',
+    person_binding_confidence REAL NOT NULL DEFAULT 0,
     import_batch_version TEXT NULL,
     ocr_text TEXT NOT NULL DEFAULT '',
     issue_date DATE NULL,
@@ -110,7 +112,7 @@ CREATE TABLE IF NOT EXISTS person_events (
     trigger_date DATE NOT NULL,
     due_date DATE NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK(status IN ('pending','completed','overdue')),
+        CHECK(status IN ('pending','due','completed','overdue')),
     source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
     source_ref TEXT NOT NULL UNIQUE,
     rule_version TEXT NOT NULL,
@@ -130,8 +132,15 @@ CREATE INDEX IF NOT EXISTS idx_person_documents_global_key
 
 INSERT OR IGNORE INTO rule_versions(rule_name,version,description) VALUES
     ('person_global_key','person-global-key-v1','人员全局唯一标识生成规则'),
+    ('person_global_key','person-global-key-v2','规范化人员全局唯一标识生成规则'),
     ('document_binding','document-binding-v1','人员资料绑定来源规则'),
-    ('person_event_engine','person-event-engine-v1','人员事件自动生成规则');
+    ('document_binding','document-binding-v2','带置信度与人工覆盖日志的资料绑定规则'),
+    ('person_event_engine','person-event-engine-v1','人员事件自动生成规则'),
+    ('person_event_engine','person-event-engine-v2','支持 due 状态的人员事件调度规则');
+
+UPDATE rule_versions SET is_active=CASE
+    WHEN version IN ('person-global-key-v2','document-binding-v2','person-event-engine-v2')
+    THEN 1 ELSE 0 END;
 
 CREATE TABLE IF NOT EXISTS person_cases (
     id INTEGER PRIMARY KEY,

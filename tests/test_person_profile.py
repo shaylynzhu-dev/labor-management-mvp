@@ -1,6 +1,7 @@
 import tempfile
 import unittest
 import io
+from datetime import date
 from pathlib import Path
 
 from app import app, get_db, init_db
@@ -10,7 +11,8 @@ from app.services.person_profile_service import (
     save_person_document_batch, search_people_for_binding, suggest_case_for_document,
 )
 from app.services.person_system_service import (
-    generate_person_global_key, refresh_person_events,
+    find_duplicate_people, generate_person_global_key, process_person_events,
+    refresh_person_events,
 )
 
 
@@ -61,7 +63,10 @@ class PersonProfileTest(unittest.TestCase):
                 1,
             )
             self.assertIn("person_global_key", columns)
-            self.assertTrue({"person_global_key", "binding_rule_version"}.issubset(document_columns))
+            self.assertTrue({
+                "person_global_key", "binding_rule_version", "person_binding_source",
+                "person_binding_confidence",
+            }.issubset(document_columns))
             for table in ("person_events", "person_change_log", "import_batch_versions", "rule_versions"):
                 self.assertIsNotNone(db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
@@ -112,6 +117,26 @@ class PersonProfileTest(unittest.TestCase):
             ).fetchone()
             self.assertEqual(event["trigger_date"], "2030-05-31")
             self.assertEqual(event["event_type"], "contract_renewal")
+            transitions = []
+            process_person_events(
+                db, lambda item, old, new: transitions.append((old, new)),
+                date(2030, 6, 1),
+            )
+            self.assertEqual(
+                db.execute("SELECT status FROM person_events WHERE id=?", (event["id"],)).fetchone()[0],
+                "due",
+            )
+            process_person_events(db, today=date(2030, 7, 1))
+            self.assertEqual(
+                db.execute("SELECT status FROM person_events WHERE id=?", (event["id"],)).fetchone()[0],
+                "overdue",
+            )
+            self.assertIn(("pending", "due"), transitions)
+            suggestions = find_duplicate_people(db, {
+                "name": "规则人员", "mainland_id_last4": "8899",
+            })
+            self.assertGreater(suggestions[0]["confidence"], 0.85)
+            self.assertIn("不会自动合并", suggestions[0]["merge_suggestion"])
 
     def test_case_suggestion_prefers_folder_and_leaves_ambiguous_unassigned(self):
         cases = [

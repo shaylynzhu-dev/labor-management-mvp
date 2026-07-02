@@ -1,5 +1,6 @@
 from datetime import date, datetime, timedelta
 import calendar
+from difflib import SequenceMatcher
 import hashlib
 import json
 from pathlib import Path
@@ -107,7 +108,9 @@ def suggest_person_by_filename(db, filename):
            FROM people p WHERE p.is_deleted=0 ORDER BY length(p.name) DESC,p.id"""
     ).fetchall():
         if row["name"] and row["name"].casefold() in filename:
-            candidates.append(dict(row))
+            candidate = dict(row)
+            candidate["confidence"] = 1.0
+            candidates.append(candidate)
     return candidates
 
 
@@ -131,6 +134,8 @@ def search_people_for_binding(db, keyword, limit=12):
             syllables = lazy_pinyin(item["name"])
             searchable += " " + "".join(syllables).casefold() + " " + " ".join(syllables).casefold()
         if not keyword or keyword in searchable:
+            name_score = SequenceMatcher(None, keyword, str(item.get("name") or "").casefold()).ratio()
+            item["confidence"] = round(1.0 if keyword and keyword in str(item.get("name") or "").casefold() else max(name_score, 0.5), 4)
             matches.append(item)
         if len(matches) >= limit:
             break
@@ -311,6 +316,7 @@ def get_renewal_alert_summary(person_case, today=None):
 
 def save_person_document_batch(
     db, upload_root, person_id, files, document_type, remarks=None, person_case_id=None,
+    person_binding_source="manual_input", person_binding_confidence=1.0,
 ):
     files = [item for item in files if item and item.filename]
     if not files:
@@ -391,8 +397,8 @@ def save_person_document_batch(
                     file_size,upload_batch_id,status,remarks,person_case_id,
                     inferred_case_confidence,case_binding_status,document_hash,
                     duplicate_of_document_id,version_no,binding_source,data_source,
-                    data_precedence_rank)
-                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                    data_precedence_rank,person_binding_source,person_binding_confidence)
+                   VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
                 (person_id, document_type, original, relative_path,
                  uploaded.mimetype or mimetypes.guess_type(original)[0] or "application/octet-stream",
                  size, batch_id, document_status, remarks, suggested_case_id,
@@ -400,7 +406,8 @@ def save_person_document_batch(
                  document_hash, duplicate["id"] if duplicate else None, version_no,
                  suggestion["source"] if suggestion else "auto_inference",
                  suggestion["source"] if suggestion else "auto_inference",
-                 data_precedence_rank(suggestion["source"] if suggestion else "auto_inference")),
+                 data_precedence_rank(suggestion["source"] if suggestion else "auto_inference"),
+                 person_binding_source, float(person_binding_confidence or 0)),
             )
             document_id = db.execute("SELECT last_insert_rowid()").fetchone()[0]
             if duplicate:
