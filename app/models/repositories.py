@@ -1,4 +1,5 @@
 import json
+import uuid
 
 
 class UserRepository:
@@ -32,16 +33,25 @@ class ImportLogRepository:
         self.database = database
 
     def create(self, import_type, filename, user_id, result):
+        batch_version = result.get("batch_version") or f"BATCH-{uuid.uuid4()}"
         with self.database.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO import_batch_versions
+                   (batch_version,import_type,filename,user_id,status,completed_at)
+                   VALUES (?,?,?,?, 'completed',CURRENT_TIMESTAMP)""",
+                (batch_version, import_type, filename, user_id),
+            )
             cursor = connection.execute(
                 """INSERT INTO import_logs
                    (import_type,filename,user_id,success_count,skipped_count,
-                    failed_count,errors_json,result_json) VALUES (?,?,?,?,?,?,?,?)""",
+                    failed_count,errors_json,result_json,batch_version)
+                   VALUES (?,?,?,?,?,?,?,?,?)""",
                 (
                     import_type, filename, user_id, result["success"],
                     result["skipped"], result["failed"],
                     json.dumps(result["errors"], ensure_ascii=False),
                     json.dumps(result, ensure_ascii=False),
+                    batch_version,
                 ),
             )
             return cursor.lastrowid

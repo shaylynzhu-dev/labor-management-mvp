@@ -1,5 +1,6 @@
 import io
 import json
+import uuid
 from datetime import date, datetime
 
 from app.utils.excel import validate_excel_shape, validate_excel_upload
@@ -7,6 +8,7 @@ from app.services.dispatch_engine import (
     CONTRACT_LIFECYCLE, normalize_contract_status, quota_replacement_limit,
     shift_months,
 )
+from app.services.person_system_service import refresh_person_events
 
 
 DEFAULT_MAPPINGS = {
@@ -144,7 +146,11 @@ class ExcelImportService:
         if mapping:
             columns.update({key: value for key, value in mapping.items() if key in columns and value})
         frame = self._frame(kind, uploaded, columns)
-        result = {"success": 0, "skipped": 0, "failed": 0, "errors": []}
+        batch_version = f"BATCH-{uuid.uuid4()}"
+        result = {
+            "success": 0, "skipped": 0, "failed": 0, "errors": [],
+            "batch_version": batch_version,
+        }
         if kind == "lifecycle":
             result.update(initial=0, replacement=0, renewal=0, resignation=0, replacement_count=0)
         with self.database.transaction() as connection:
@@ -152,7 +158,11 @@ class ExcelImportService:
                 line = int(index) + 2
                 connection.execute("SAVEPOINT production_import_row")
                 try:
-                    outcome = getattr(self, f"_import_{kind}")(connection, row, columns)
+                    importer = getattr(self, f"_import_{kind}")
+                    outcome = (
+                        importer(connection, row, columns, batch_version)
+                        if kind == "person" else importer(connection, row, columns)
+                    )
                     if isinstance(outcome, dict):
                         result[outcome["outcome"]] += 1
                         classification = outcome.get("classification")
@@ -169,6 +179,8 @@ class ExcelImportService:
                     result["failed"] += 1
                     result["errors"].append({"row": line, "message": str(error)})
         result["mapping"] = columns
+        with self.database.connect() as connection:
+            refresh_person_events(connection)
         log_id = self.log_repository.create(kind, uploaded.filename, user_id, result)
         result["log_id"] = log_id
         return result
@@ -177,7 +189,7 @@ class ExcelImportService:
         column = columns.get(key)
         return row.get(column) if column in row else None
 
-    def _import_person(self, connection, row, columns):
+    def _import_person(self, connection, row, columns, batch_version=None):
         name = self._text(self._value(row, columns, "name"))
         gender = self._text(self._value(row, columns, "gender"))
         if not name:
@@ -222,8 +234,9 @@ class ExcelImportService:
                (name,person_name,gender,company_name,introducer,id_last4,permit_last4,
                 worker_type,birth_date,birth_year_month,mainland_id_first4,
                 mainland_id_last4,hkmo_permit_first4,hkmo_permit_last6,
-                entry_permit_no,hk_submission_date,visa_status_date,visa_status,remarks)
-               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""",
+                entry_permit_no,hk_submission_date,visa_status_date,visa_status,remarks,
+                import_batch_version,data_source,data_precedence_rank)
+               VALUES (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'excel_import',5)""",
             (name, name, gender, company, introducer, mainland_last4, legacy_permit_last4,
              worker_type, birth_date, birth_year_month, mainland_first4, mainland_last4,
              permit_first4, permit_last6,
@@ -231,7 +244,7 @@ class ExcelImportService:
              self._date(self._value(row, columns, "hk_submission_date")),
              self._date(self._value(row, columns, "visa_status_date")),
              visa_status,
-             self._text(self._value(row, columns, "remarks"))),
+             self._text(self._value(row, columns, "remarks")), batch_version),
         )
         connection.execute(
             """INSERT INTO events(person_id,event_type,note,created_at)

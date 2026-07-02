@@ -24,6 +24,9 @@ CREATE TABLE IF NOT EXISTS person (
     remarks TEXT NULL,
     data_source TEXT NOT NULL DEFAULT 'manual_input',
     data_precedence_rank INTEGER NOT NULL DEFAULT 1,
+    person_global_key TEXT UNIQUE,
+    identity_rule_version TEXT NULL,
+    import_batch_version TEXT NULL,
     is_deleted INTEGER NOT NULL DEFAULT 0 CHECK(is_deleted IN (0, 1)),
     deleted_at DATETIME NULL,
     deleted_by INTEGER NULL,
@@ -48,6 +51,9 @@ CREATE TABLE IF NOT EXISTS person_documents (
     binding_source TEXT NOT NULL DEFAULT 'auto_inference',
     data_source TEXT NOT NULL DEFAULT 'auto_inference',
     data_precedence_rank INTEGER NOT NULL DEFAULT 6,
+    person_global_key TEXT NULL,
+    binding_rule_version TEXT NOT NULL DEFAULT 'document-binding-v1',
+    import_batch_version TEXT NULL,
     ocr_text TEXT NOT NULL DEFAULT '',
     issue_date DATE NULL,
     expiry_date DATE NULL,
@@ -61,6 +67,71 @@ CREATE TABLE IF NOT EXISTS person_documents (
     FOREIGN KEY(person_case_id) REFERENCES person_cases(id) ON DELETE SET NULL,
     FOREIGN KEY(duplicate_of_document_id) REFERENCES person_documents(id) ON DELETE SET NULL
 );
+
+CREATE TABLE IF NOT EXISTS rule_versions (
+    rule_name TEXT NOT NULL,
+    version TEXT NOT NULL,
+    description TEXT NULL,
+    is_active INTEGER NOT NULL DEFAULT 1,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    PRIMARY KEY(rule_name, version)
+);
+
+CREATE TABLE IF NOT EXISTS import_batch_versions (
+    id INTEGER PRIMARY KEY,
+    batch_version TEXT NOT NULL UNIQUE,
+    import_type TEXT NOT NULL,
+    filename TEXT NULL,
+    user_id INTEGER NULL,
+    status TEXT NOT NULL DEFAULT 'processing',
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    completed_at DATETIME NULL
+);
+
+CREATE TABLE IF NOT EXISTS person_change_log (
+    id INTEGER PRIMARY KEY,
+    person_global_key TEXT NOT NULL,
+    action TEXT NOT NULL,
+    entity_type TEXT NOT NULL DEFAULT 'person',
+    entity_id TEXT NULL,
+    old_data TEXT NULL,
+    new_data TEXT NULL,
+    source TEXT NOT NULL DEFAULT 'system',
+    import_batch_version TEXT NULL,
+    rule_version TEXT NULL,
+    changed_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+
+CREATE TABLE IF NOT EXISTS person_events (
+    id INTEGER PRIMARY KEY,
+    person_global_key TEXT NOT NULL,
+    event_type TEXT NOT NULL CHECK(event_type IN
+        ('contract_renewal','visa_submission','permit_expiry','document_missing')),
+    trigger_date DATE NOT NULL,
+    due_date DATE NULL,
+    status TEXT NOT NULL DEFAULT 'pending'
+        CHECK(status IN ('pending','completed','overdue')),
+    source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
+    source_ref TEXT NOT NULL UNIQUE,
+    rule_version TEXT NOT NULL,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    FOREIGN KEY(person_global_key) REFERENCES person(person_global_key) ON DELETE RESTRICT
+);
+
+CREATE INDEX IF NOT EXISTS idx_person_events_due
+    ON person_events(status, trigger_date, due_date);
+CREATE INDEX IF NOT EXISTS idx_person_events_key
+    ON person_events(person_global_key, event_type);
+CREATE INDEX IF NOT EXISTS idx_person_change_log_key
+    ON person_change_log(person_global_key, changed_at DESC);
+CREATE INDEX IF NOT EXISTS idx_person_documents_global_key
+    ON person_documents(person_global_key, is_deleted);
+
+INSERT OR IGNORE INTO rule_versions(rule_name,version,description) VALUES
+    ('person_global_key','person-global-key-v1','人员全局唯一标识生成规则'),
+    ('document_binding','document-binding-v1','人员资料绑定来源规则'),
+    ('person_event_engine','person-event-engine-v1','人员事件自动生成规则');
 
 CREATE TABLE IF NOT EXISTS person_cases (
     id INTEGER PRIMARY KEY,

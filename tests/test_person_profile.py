@@ -9,6 +9,9 @@ from app.services.person_profile_service import (
     get_missing_documents, get_person_profile, suggest_person_by_filename,
     save_person_document_batch, search_people_for_binding, suggest_case_for_document,
 )
+from app.services.person_system_service import (
+    generate_person_global_key, refresh_person_events,
+)
 
 
 class PersonProfileTest(unittest.TestCase):
@@ -57,6 +60,12 @@ class PersonProfileTest(unittest.TestCase):
                 db.execute("SELECT rank FROM data_precedence_rules WHERE source='manual_input'").fetchone()[0],
                 1,
             )
+            self.assertIn("person_global_key", columns)
+            self.assertTrue({"person_global_key", "binding_rule_version"}.issubset(document_columns))
+            for table in ("person_events", "person_change_log", "import_batch_versions", "rule_versions"):
+                self.assertIsNotNone(db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone())
 
             person = {
                 "worker_type": "new", "mainland_id_first4": "1234",
@@ -72,6 +81,37 @@ class PersonProfileTest(unittest.TestCase):
             db.commit()
             suggestions = suggest_person_by_filename(db, "陈小明_合同.pdf")
             self.assertEqual([item["name"] for item in suggestions], ["陈小明"])
+
+    def test_global_key_event_engine_and_change_history(self):
+        self.assertTrue(generate_person_global_key(
+            "规则人员", "CJ52", "123456", "1990-01-01", "8899"
+        ).startswith("HKP-"))
+        with app.app_context():
+            db = get_db()
+            person_id = db.execute(
+                """INSERT INTO people
+                   (name,person_name,gender,mainland_id_last4,data_source)
+                   VALUES ('规则人员','规则人员','男','8899','manual_input')"""
+            ).lastrowid
+            person = db.execute("SELECT * FROM people WHERE id=?", (person_id,)).fetchone()
+            self.assertTrue(person["person_global_key"].startswith("MID-"))
+            self.assertIsNotNone(db.execute(
+                "SELECT 1 FROM person_change_log WHERE person_global_key=? AND action='create'",
+                (person["person_global_key"],),
+            ).fetchone())
+            db.execute(
+                """INSERT INTO contracts
+                   (contract_id,person_name,company,status,person_id,end_date)
+                   VALUES ('C-EVENT-1','规则人员','测试公司','制作合同',?,'2030-06-30')""",
+                (person_id,),
+            )
+            db.commit()
+            refresh_person_events(db)
+            event = db.execute(
+                "SELECT * FROM person_events WHERE source_ref='contract:C-EVENT-1:renewal'"
+            ).fetchone()
+            self.assertEqual(event["trigger_date"], "2030-05-31")
+            self.assertEqual(event["event_type"], "contract_renewal")
 
     def test_case_suggestion_prefers_folder_and_leaves_ambiguous_unassigned(self):
         cases = [

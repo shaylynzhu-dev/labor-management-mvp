@@ -1,6 +1,8 @@
 import sqlite3
 from contextlib import contextmanager
 
+from app.services.person_system_service import sqlite_person_global_key
+
 
 class Database:
     def __init__(self, path):
@@ -9,6 +11,7 @@ class Database:
     def connect(self):
         connection = sqlite3.connect(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
+        connection.create_function("person_global_key", 5, sqlite_person_global_key)
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=30000")
@@ -66,6 +69,8 @@ class Database:
                 connection.execute(
                     "ALTER TABLE import_logs ADD COLUMN result_json TEXT NOT NULL DEFAULT '{}'"
                 )
+            if "batch_version" not in import_columns:
+                connection.execute("ALTER TABLE import_logs ADD COLUMN batch_version TEXT")
             users_sql = connection.execute(
                 "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
             ).fetchone()["sql"]

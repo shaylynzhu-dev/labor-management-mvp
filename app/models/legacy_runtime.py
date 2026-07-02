@@ -29,6 +29,10 @@ from app.services.person_profile_service import (
     document_hash_from_path, find_duplicate_document, queue_conflict, queue_retry,
     search_people_for_binding, suggest_case_for_document, suggest_person_by_filename,
 )
+from app.services.person_system_service import (
+    DOCUMENT_BINDING_RULE_VERSION, EVENT_ENGINE_RULE_VERSION, PERSON_KEY_RULE_VERSION,
+    backfill_person_global_keys, refresh_person_events, sqlite_person_global_key,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -68,6 +72,7 @@ def get_db():
     if "db" not in g:
         g.db = sqlite3.connect(app.config["DATABASE"])
         g.db.row_factory = sqlite3.Row
+        g.db.create_function("person_global_key", 5, sqlite_person_global_key)
         g.db.execute("PRAGMA foreign_keys = ON")
     return g.db
 
@@ -284,13 +289,25 @@ def excel_date(value, pd, row_number, column_name):
         raise ValueError(f"第 {row_number} 行“{column_name}”日期无效。") from error
 
 
-def excel_import_result(label, view, imported, skipped, failed, errors):
+def excel_import_result(label, view, imported, skipped, failed, errors, batch_version=None):
+    batch_version = batch_version or f"BATCH-{uuid.uuid4()}"
+    uploaded = request.files.get("file")
+    db = get_db()
+    db.execute(
+        """INSERT OR IGNORE INTO import_batch_versions
+           (batch_version,import_type,filename,user_id,status,completed_at)
+           VALUES (?,?,?,?,?,CURRENT_TIMESTAMP)""",
+        (batch_version, label, getattr(uploaded, "filename", None), session.get("user_id"),
+         "completed" if failed == 0 else "completed_with_errors"),
+    )
+    db.commit()
     payload = {
         "type": label,
         "success": imported,
         "skipped": skipped,
         "failed": failed,
         "errors": errors[:20],
+        "batch_version": batch_version,
     }
     if request.args.get("format") == "json":
         return api_response(0, "导入完成", payload)
@@ -829,6 +846,9 @@ def init_db():
             permit_last4 TEXT CHECK(permit_last4 IS NULL OR length(permit_last4) = 4),
             data_source TEXT NOT NULL DEFAULT 'manual_input',
             data_precedence_rank INTEGER NOT NULL DEFAULT 1,
+            person_global_key TEXT UNIQUE,
+            identity_rule_version TEXT,
+            import_batch_version TEXT,
             created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
 
@@ -1014,6 +1034,9 @@ def init_db():
             binding_source TEXT NOT NULL DEFAULT 'auto_inference',
             data_source TEXT NOT NULL DEFAULT 'auto_inference',
             data_precedence_rank INTEGER NOT NULL DEFAULT 6,
+            person_global_key TEXT,
+            binding_rule_version TEXT NOT NULL DEFAULT 'document-binding-v1',
+            import_batch_version TEXT,
             ocr_text TEXT NOT NULL DEFAULT '',
             issue_date TEXT,
             expiry_date TEXT,
@@ -1244,6 +1267,8 @@ def init_db():
         "hk_id_appointment_status": "TEXT", "remarks": "TEXT",
         "data_source": "TEXT NOT NULL DEFAULT 'manual_input'",
         "data_precedence_rank": "INTEGER NOT NULL DEFAULT 1",
+        "person_global_key": "TEXT", "identity_rule_version": "TEXT",
+        "import_batch_version": "TEXT",
     }
     current_person_columns = {
         row["name"] for row in db.execute("PRAGMA table_info(people)").fetchall()
@@ -1265,6 +1290,8 @@ def init_db():
         "binding_source": "TEXT NOT NULL DEFAULT 'auto_inference'",
         "data_source": "TEXT NOT NULL DEFAULT 'auto_inference'",
         "data_precedence_rank": "INTEGER NOT NULL DEFAULT 6",
+        "person_global_key": "TEXT", "binding_rule_version": "TEXT",
+        "import_batch_version": "TEXT",
     }.items():
         if column not in person_document_columns:
             db.execute(f"ALTER TABLE person_documents ADD COLUMN {column} {definition}")
@@ -1321,6 +1348,71 @@ def init_db():
             label TEXT NOT NULL
         )"""
     )
+    db.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS rule_versions (
+            rule_name TEXT NOT NULL,
+            version TEXT NOT NULL,
+            description TEXT,
+            is_active INTEGER NOT NULL DEFAULT 1,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            PRIMARY KEY(rule_name,version)
+        );
+        CREATE TABLE IF NOT EXISTS import_batch_versions (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            batch_version TEXT NOT NULL UNIQUE,
+            import_type TEXT NOT NULL,
+            filename TEXT,
+            user_id INTEGER,
+            status TEXT NOT NULL DEFAULT 'processing',
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            completed_at TEXT
+        );
+        CREATE TABLE IF NOT EXISTS person_change_log (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_global_key TEXT NOT NULL,
+            action TEXT NOT NULL,
+            entity_type TEXT NOT NULL DEFAULT 'person',
+            entity_id TEXT,
+            old_data TEXT,
+            new_data TEXT,
+            source TEXT NOT NULL DEFAULT 'system',
+            import_batch_version TEXT,
+            rule_version TEXT,
+            changed_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE TABLE IF NOT EXISTS person_events (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            person_global_key TEXT NOT NULL,
+            event_type TEXT NOT NULL CHECK(event_type IN
+                ('contract_renewal','visa_submission','permit_expiry','document_missing')),
+            trigger_date TEXT NOT NULL,
+            due_date TEXT,
+            status TEXT NOT NULL DEFAULT 'pending'
+                CHECK(status IN ('pending','completed','overdue')),
+            source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
+            source_ref TEXT NOT NULL UNIQUE,
+            rule_version TEXT NOT NULL,
+            created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+            updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS idx_person_events_due
+            ON person_events(status,trigger_date,due_date);
+        CREATE INDEX IF NOT EXISTS idx_person_events_key
+            ON person_events(person_global_key,event_type);
+        CREATE INDEX IF NOT EXISTS idx_person_change_log_key
+            ON person_change_log(person_global_key,changed_at DESC);
+        """
+    )
+    db.executemany(
+        """INSERT OR IGNORE INTO rule_versions(rule_name,version,description)
+           VALUES (?,?,?)""",
+        (
+            ("person_global_key", PERSON_KEY_RULE_VERSION, "人员全局唯一标识生成规则"),
+            ("document_binding", DOCUMENT_BINDING_RULE_VERSION, "人员资料绑定来源规则"),
+            ("person_event_engine", EVENT_ENGINE_RULE_VERSION, "人员事件自动生成规则"),
+        ),
+    )
     db.executemany(
         "INSERT OR IGNORE INTO data_precedence_rules(source,rank,label) VALUES (?,?,?)",
         (
@@ -1366,6 +1458,145 @@ def init_db():
                     WHEN '未出' THEN '未出' WHEN '待缴费' THEN '待缴费'
                     WHEN '已出' THEN '已出' ELSE NULL END
            """
+    )
+    backfill_person_global_keys(db)
+    db.execute(
+        "CREATE UNIQUE INDEX IF NOT EXISTS idx_people_global_key ON people(person_global_key)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_person_documents_global_key ON person_documents(person_global_key,is_deleted)"
+    )
+    db.executescript(
+        f"""
+        CREATE TRIGGER IF NOT EXISTS trg_people_global_key_insert
+        AFTER INSERT ON people
+        WHEN NEW.person_global_key IS NULL OR NEW.person_global_key=''
+        BEGIN
+          UPDATE people SET
+            person_global_key=person_global_key(NEW.name,NEW.hkmo_permit_first4,
+              NEW.hkmo_permit_last6,NEW.birth_date,COALESCE(NEW.mainland_id_last4,NEW.id_last4)),
+            identity_rule_version='{PERSON_KEY_RULE_VERSION}'
+          WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_person_documents_global_key_insert
+        AFTER INSERT ON person_documents
+        WHEN NEW.person_global_key IS NULL OR NEW.person_global_key=''
+        BEGIN
+          UPDATE person_documents SET
+            person_global_key=(SELECT person_global_key FROM people WHERE id=NEW.person_id),
+            binding_rule_version=COALESCE(NULLIF(NEW.binding_rule_version,''),'{DOCUMENT_BINDING_RULE_VERSION}')
+          WHERE id=NEW.id;
+          INSERT INTO person_change_log
+            (person_global_key,action,entity_type,entity_id,new_data,source,
+             import_batch_version,rule_version)
+          SELECT person_global_key,'bind','person_document',CAST(id AS TEXT),
+            json_object('person_id',person_id,'person_case_id',person_case_id,
+              'binding_source',binding_source,'filename',original_filename),
+            COALESCE(binding_source,'auto_inference'),import_batch_version,
+            COALESCE(binding_rule_version,'{DOCUMENT_BINDING_RULE_VERSION}')
+          FROM person_documents WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_person_documents_global_key_rebind
+        AFTER UPDATE OF person_id ON person_documents
+        BEGIN
+          UPDATE person_documents SET
+            person_global_key=(SELECT person_global_key FROM people WHERE id=NEW.person_id),
+            binding_rule_version='{DOCUMENT_BINDING_RULE_VERSION}'
+          WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_people_change_insert
+        AFTER INSERT ON people
+        WHEN NEW.person_global_key IS NOT NULL AND NEW.person_global_key!=''
+        BEGIN
+          INSERT INTO person_change_log
+            (person_global_key,action,entity_type,entity_id,new_data,source,
+             import_batch_version,rule_version)
+          SELECT person_global_key,'create','person',CAST(id AS TEXT),
+            json_object('name',name,'company_name',company_name,'worker_type',worker_type),
+            COALESCE(data_source,'system'),import_batch_version,
+            COALESCE(identity_rule_version,'{PERSON_KEY_RULE_VERSION}')
+          FROM people WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_people_change_update
+        AFTER UPDATE ON people
+        WHEN OLD.person_global_key IS NOT NEW.person_global_key
+          OR OLD.name IS NOT NEW.name OR OLD.gender IS NOT NEW.gender
+          OR OLD.company_name IS NOT NEW.company_name OR OLD.introducer IS NOT NEW.introducer
+          OR OLD.worker_type IS NOT NEW.worker_type OR OLD.id_last4 IS NOT NEW.id_last4
+          OR OLD.permit_last4 IS NOT NEW.permit_last4
+          OR OLD.birth_date IS NOT NEW.birth_date OR OLD.mainland_id_last4 IS NOT NEW.mainland_id_last4
+          OR OLD.mainland_id_first4 IS NOT NEW.mainland_id_first4
+          OR OLD.hkmo_permit_first4 IS NOT NEW.hkmo_permit_first4
+          OR OLD.hkmo_permit_last6 IS NOT NEW.hkmo_permit_last6
+          OR OLD.entry_permit_no IS NOT NEW.entry_permit_no
+          OR OLD.hk_submission_date IS NOT NEW.hk_submission_date
+          OR OLD.visa_status_date IS NOT NEW.visa_status_date
+          OR OLD.visa_status IS NOT NEW.visa_status
+          OR OLD.hk_id_appointment_status IS NOT NEW.hk_id_appointment_status
+          OR OLD.remarks IS NOT NEW.remarks OR OLD.is_deleted IS NOT NEW.is_deleted
+        BEGIN
+          INSERT INTO person_change_log
+            (person_global_key,action,entity_type,entity_id,old_data,new_data,source,
+             import_batch_version,rule_version)
+          VALUES (NEW.person_global_key,
+            CASE WHEN OLD.person_global_key IS NULL OR OLD.person_global_key='' THEN 'create' ELSE 'update' END,
+            'person',CAST(NEW.id AS TEXT),
+            json_object('name',OLD.name,'gender',OLD.gender,'company_name',OLD.company_name,
+              'introducer',OLD.introducer,'worker_type',OLD.worker_type,'birth_date',OLD.birth_date,
+              'mainland_id_first4',OLD.mainland_id_first4,'mainland_id_last4',OLD.mainland_id_last4,
+              'hkmo_permit_first4',OLD.hkmo_permit_first4,'hkmo_permit_last6',OLD.hkmo_permit_last6,
+              'entry_permit_no',OLD.entry_permit_no,'hk_submission_date',OLD.hk_submission_date,
+              'visa_status_date',OLD.visa_status_date,'visa_status',OLD.visa_status,
+              'hk_id_appointment_status',OLD.hk_id_appointment_status,'remarks',OLD.remarks,
+              'is_deleted',OLD.is_deleted),
+            json_object('name',NEW.name,'gender',NEW.gender,'company_name',NEW.company_name,
+              'introducer',NEW.introducer,'worker_type',NEW.worker_type,'birth_date',NEW.birth_date,
+              'mainland_id_first4',NEW.mainland_id_first4,'mainland_id_last4',NEW.mainland_id_last4,
+              'hkmo_permit_first4',NEW.hkmo_permit_first4,'hkmo_permit_last6',NEW.hkmo_permit_last6,
+              'entry_permit_no',NEW.entry_permit_no,'hk_submission_date',NEW.hk_submission_date,
+              'visa_status_date',NEW.visa_status_date,'visa_status',NEW.visa_status,
+              'hk_id_appointment_status',NEW.hk_id_appointment_status,'remarks',NEW.remarks,
+              'is_deleted',NEW.is_deleted),
+            COALESCE(NEW.data_source,'system'),NEW.import_batch_version,
+            COALESCE(NEW.identity_rule_version,'{PERSON_KEY_RULE_VERSION}'));
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_document_binding_change_insert
+        AFTER INSERT ON person_documents
+        WHEN NEW.person_global_key IS NOT NULL AND NEW.person_global_key!=''
+        BEGIN
+          INSERT INTO person_change_log
+            (person_global_key,action,entity_type,entity_id,new_data,source,
+             import_batch_version,rule_version)
+          SELECT person_global_key,'bind','person_document',CAST(id AS TEXT),
+            json_object('person_id',person_id,'person_case_id',person_case_id,
+              'binding_source',binding_source,'filename',original_filename),
+            COALESCE(binding_source,'auto_inference'),import_batch_version,
+            COALESCE(binding_rule_version,'{DOCUMENT_BINDING_RULE_VERSION}')
+          FROM person_documents WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_document_binding_change_update
+        AFTER UPDATE OF person_id,person_case_id,case_binding_status ON person_documents
+        WHEN OLD.person_id IS NOT NEW.person_id OR OLD.person_case_id IS NOT NEW.person_case_id
+          OR OLD.case_binding_status IS NOT NEW.case_binding_status
+        BEGIN
+          INSERT INTO person_change_log
+            (person_global_key,action,entity_type,entity_id,old_data,new_data,source,
+             import_batch_version,rule_version)
+          VALUES (NEW.person_global_key,'rebind','person_document',CAST(NEW.id AS TEXT),
+            json_object('person_id',OLD.person_id,'person_case_id',OLD.person_case_id,
+              'binding_status',OLD.case_binding_status),
+            json_object('person_id',NEW.person_id,'person_case_id',NEW.person_case_id,
+              'binding_status',NEW.case_binding_status),
+            COALESCE(NEW.binding_source,'manual_input'),NEW.import_batch_version,
+            COALESCE(NEW.binding_rule_version,'{DOCUMENT_BINDING_RULE_VERSION}'));
+        END;
+        """
     )
 
     document_columns = {
@@ -1519,6 +1750,7 @@ def init_db():
     initialize_standard_schema(db)
     ensure_soft_delete_schema(db)
     db.commit()
+    refresh_person_events(db)
 
 
 @app.cli.command("init-db")
@@ -2242,6 +2474,7 @@ def index(default_view="overview"):
     db = get_db()
     refresh_renewal_statuses(db)
     refresh_standard_risks(db)
+    refresh_person_events(db)
     valid_views = {
         "overview", "contracts", "people", "quotas", "renewals", "events", "ai",
         "documents", "workflows", "lifecycle", "risks", "tasks",
@@ -2943,6 +3176,7 @@ def update_person_case_renewal_alerts(person_id, case_id):
     )
     db.commit()
     refresh_person_case_alerts(db)
+    refresh_person_events(db)
     flash("续约提醒日期已保存。", "success")
     return redirect(url_for("person_detail", person_id=person_id))
 
@@ -2959,14 +3193,15 @@ def quotas_page():
 
 @app.post("/upload/person_excel")
 def upload_person_excel():
+    batch_version = f"BATCH-{uuid.uuid4()}"
     try:
         frame, pd = read_excel_upload(request.files.get("file"), ("姓名", "性别"))
     except (ValueError, RuntimeError) as error:
         app.logger.warning("Person Excel import rejected: %s", error)
-        return excel_import_result("人员 Excel", "people", 0, 0, 1, [str(error)])
+        return excel_import_result("人员 Excel", "people", 0, 0, 1, [str(error)], batch_version)
     if frame.empty:
         return excel_import_result(
-            "人员 Excel", "people", 0, 0, 1, ["Excel 中没有可导入的数据。"]
+            "人员 Excel", "people", 0, 0, 1, ["Excel 中没有可导入的数据。"], batch_version
         )
     db = get_db()
     imported = skipped = failed = 0
@@ -3013,9 +3248,10 @@ def upload_person_excel():
                     cursor = db.execute(
                         """INSERT INTO people
                            (name, gender, company_name, introducer, id_last4, permit_last4,
-                            data_source,data_precedence_rank)
-                           VALUES (?, ?, ?, ?, ?, ?, 'excel_import', 5)""",
-                        (name, gender, company_name, introducer, id_last4, permit_last4),
+                            data_source,data_precedence_rank,import_batch_version)
+                           VALUES (?, ?, ?, ?, ?, ?, 'excel_import', 5, ?)""",
+                        (name, gender, company_name, introducer, id_last4, permit_last4,
+                         batch_version),
                     )
                     db.execute(
                         """INSERT INTO events
@@ -3040,20 +3276,21 @@ def upload_person_excel():
     if failed:
         app.logger.warning("Person Excel row errors: %s", errors[:20])
     return excel_import_result(
-        "人员 Excel", "people", imported, skipped, failed, errors
+        "人员 Excel", "people", imported, skipped, failed, errors, batch_version
     )
 
 
 @app.post("/upload/quota_excel")
 def upload_quota_excel():
+    batch_version = f"BATCH-{uuid.uuid4()}"
     try:
         frame, pd = read_excel_upload(request.files.get("file"), ("配额类型", "公司名"))
     except (ValueError, RuntimeError) as error:
         app.logger.warning("Quota Excel import rejected: %s", error)
-        return excel_import_result("配额 Excel", "quotas", 0, 0, 1, [str(error)])
+        return excel_import_result("配额 Excel", "quotas", 0, 0, 1, [str(error)], batch_version)
     if frame.empty:
         return excel_import_result(
-            "配额 Excel", "quotas", 0, 0, 1, ["Excel 中没有可导入的数据。"]
+            "配额 Excel", "quotas", 0, 0, 1, ["Excel 中没有可导入的数据。"], batch_version
         )
     db = get_db()
     imported = skipped = failed = 0
@@ -3152,7 +3389,7 @@ def upload_quota_excel():
     if failed:
         app.logger.warning("Quota Excel row errors: %s", errors[:20])
     return excel_import_result(
-        "配额 Excel", "quotas", imported, skipped, failed, errors
+        "配额 Excel", "quotas", imported, skipped, failed, errors, batch_version
     )
 
 
@@ -3455,6 +3692,7 @@ def update_contract_status(contract_id):
             contract_id=standard_contract["id"],
         )
     db.commit()
+    refresh_person_events(db)
     flash(f"合同状态已更新为：{status}", "success")
     return redirect(url_for("contract_detail", contract_id=contract_id))
 
@@ -3502,6 +3740,7 @@ def add_contract():
             contract_id=standard_contract["id"] if standard_contract else None,
         )
         db.commit()
+        refresh_person_events(db)
     except sqlite3.IntegrityError:
         db.rollback()
         flash("合同编号已存在，或合同数据不符合约束。", "error")
