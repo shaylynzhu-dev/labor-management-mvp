@@ -9,6 +9,7 @@ import re
 import uuid
 
 from werkzeug.utils import secure_filename
+from app.services.contract_safety_service import filter_valid_contracts
 
 try:
     from pypinyin import lazy_pinyin
@@ -104,13 +105,48 @@ def suggest_person_by_filename(db, filename):
         """SELECT p.id,p.name,p.company_name,p.worker_type,p.entry_permit_no,p.visa_status,
                   (SELECT c.contract_id FROM contracts c
                    WHERE c.person_id=p.id AND c.is_deleted=0
-                   ORDER BY c.created_at DESC,c.id DESC LIMIT 1) AS recent_contract
+                   ORDER BY c.created_at DESC,c.contract_id DESC LIMIT 1) AS recent_contract
            FROM people p WHERE p.is_deleted=0 ORDER BY length(p.name) DESC,p.id"""
     ).fetchall():
         if row["name"] and row["name"].casefold() in filename:
             candidate = dict(row)
             candidate["confidence"] = 1.0
             candidates.append(candidate)
+    return candidates
+
+
+def suggest_person_for_document(db, filename="", ocr_text="", metadata="", person_global_key=None):
+    """Binding precedence: global key, name, company+name, OCR, manual confirmation."""
+    if person_global_key:
+        exact = db.execute(
+            """SELECT id,name,company_name,person_global_key FROM people
+               WHERE person_global_key=? AND is_deleted=0""",
+            (person_global_key,),
+        ).fetchone()
+        if exact:
+            result = dict(exact)
+            result.update(confidence=1.0, binding_method="person_global_key")
+            return [result]
+    clue = " ".join(str(value or "") for value in (filename, metadata, ocr_text))
+    key_match = db.execute(
+        """SELECT id,name,company_name,person_global_key FROM people
+           WHERE is_deleted=0 AND person_global_key IS NOT NULL AND instr(?,person_global_key)>0
+           ORDER BY id""",
+        (clue,),
+    ).fetchall()
+    if key_match:
+        return [dict(row, confidence=1.0, binding_method="person_global_key") for row in key_match]
+    candidates = suggest_person_by_filename(db, clue)
+    for candidate in candidates:
+        company = candidate.get("company_name") or ""
+        if company and company.casefold() in clue.casefold():
+            candidate.update(confidence=0.98, binding_method="company_name")
+        elif candidate["name"].casefold() in str(filename or "").casefold():
+            candidate.update(confidence=0.94, binding_method="name_fuzzy")
+        elif candidate["name"].casefold() in str(ocr_text or "").casefold():
+            candidate.update(confidence=0.88, binding_method="ocr_fallback")
+        else:
+            candidate.update(confidence=0.86, binding_method="metadata_fallback")
     return candidates
 
 
@@ -121,7 +157,7 @@ def search_people_for_binding(db, keyword, limit=12):
         """SELECT p.id,p.name,p.company_name,p.worker_type,p.entry_permit_no,p.visa_status,
                   (SELECT c.contract_id FROM contracts c
                    WHERE c.person_id=p.id AND c.is_deleted=0
-                   ORDER BY c.created_at DESC,c.id DESC LIMIT 1) AS recent_contract
+                   ORDER BY c.created_at DESC,c.contract_id DESC LIMIT 1) AS recent_contract
            FROM people p WHERE p.is_deleted=0 ORDER BY p.id DESC"""
     ).fetchall()
     matches = []
@@ -509,10 +545,10 @@ def get_person_profile(db, person_id, can_view_sensitive=False):
         "person_cases": cases,
         "case_sections": case_sections,
         "unconfirmed_documents": unconfirmed_documents,
-        "contracts": db.execute(
+        "contracts": filter_valid_contracts(db.execute(
             "SELECT * FROM contracts WHERE person_id=? AND is_deleted=0 ORDER BY created_at DESC",
             (person_id,),
-        ).fetchall(),
+        ).fetchall()),
         "workflows": db.execute(
             "SELECT * FROM workflow_instances WHERE person_id=? AND is_deleted=0 ORDER BY id DESC",
             (person_id,),

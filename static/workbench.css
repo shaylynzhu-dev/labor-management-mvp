@@ -121,6 +121,7 @@
 .workbench-ui .quick-actions { grid-template-columns: 1.2fr repeat(4, 1fr); box-shadow: none; }
 .workbench-ui .quick-action:hover { background: #f5f8fd; }
 .mobile-nav { display: none; }
+.system-chip{height:36px;padding:0 11px;border:1px solid var(--work-line);border-radius:999px;background:#fff;color:#52657b;font-size:11px;font-weight:750;white-space:nowrap}.system-chip.running{border-color:#8bc7aa;background:#eef9f3;color:#187247}.system-chip.stopped{border-color:#efb4aa;background:#fff2ef;color:#a33d31}.notification-panel{position:fixed;z-index:70;top:88px;right:28px;width:min(380px,calc(100vw - 28px));max-height:70vh;overflow:auto;border:1px solid var(--work-line);border-radius:14px;background:#fff;box-shadow:0 24px 70px rgba(20,42,70,.2)}.notification-head{position:sticky;top:0;display:flex;align-items:center;justify-content:space-between;padding:14px 16px;border-bottom:1px solid var(--work-line);background:#fff}.notification-head button{border:0;background:none;font-size:22px}.notification-panel article{padding:13px 16px;border-bottom:1px solid var(--work-line)}.notification-panel article strong,.notification-panel article small{display:block}.notification-panel article p{margin:5px 0;color:#52657b}.notification-panel article small{color:#8290a2}.merge-dialog-body{padding:24px}.merge-candidate-card{display:flex;align-items:center;justify-content:space-between;gap:14px;padding:13px;border:1px solid var(--work-line);border-radius:10px;margin:9px 0}.merge-candidate-card strong,.merge-candidate-card span,.merge-candidate-card small{display:block}.merge-candidate-card span,.merge-candidate-card small{margin-top:4px;color:#6c7d90}.ui-safe-toast{position:fixed;z-index:100;right:20px;bottom:20px;padding:12px 15px;border-radius:9px;background:#25384d;color:#fff;box-shadow:0 10px 30px rgba(0,0,0,.2);animation:safe-toast 4s forwards}@keyframes safe-toast{0%,80%{opacity:1}100%{opacity:0;pointer-events:none}}
 body[data-can-delete="0"] [data-delete-resource],
 body[data-can-update="0"] [data-card-edit],
 body[data-can-update="0"] [data-assign-quota],
@@ -146,6 +147,7 @@ body[data-can-create="0"] [data-event-person] { display: none !important; }
   .workbench-ui .sidebar nav, .workbench-ui .admin { display: none; }
   .workbench-ui .app-shell { margin: 0; padding: 0 12px 24px; }
   .workbench-ui .topbar { display: grid; grid-template-columns: 1fr; gap: 12px; padding: 16px 0; }
+  .notification-panel{top:72px;right:14px}.merge-candidate-card{align-items:stretch;flex-direction:column}
   .workbench-ui .page-title { display: none; }
   .workbench-ui .search { grid-column: auto; grid-row: auto; }
   .workbench-ui .query-key { display: none; }

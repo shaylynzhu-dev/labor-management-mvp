@@ -6,7 +6,7 @@ import unicodedata
 import uuid
 
 
-PERSON_KEY_RULE_VERSION = "person-global-key-v2"
+PERSON_KEY_RULE_VERSION = "person-global-key-v3"
 DOCUMENT_BINDING_RULE_VERSION = "document-binding-v2"
 EVENT_ENGINE_RULE_VERSION = "person-event-engine-v2"
 
@@ -18,11 +18,18 @@ def _clean(value):
 
 def generate_person_global_key(
     name, hkmo_permit_first4=None, hkmo_permit_last6=None,
-    birth_date=None, mainland_id_last4=None,
+    birth_date=None, mainland_id_last4=None, mainland_id_first4=None, company_name=None,
 ):
     """Generate a non-sensitive stable key using the documented precedence."""
     normalized_name = _clean(name)
     name_hash = hashlib.sha256(normalized_name.encode("utf-8")).hexdigest()[:12]
+    id_prefix = _clean(mainland_id_first4)
+    company = _clean(company_name)
+    if id_prefix and company:
+        identity_hash = hashlib.sha256(
+            f"{normalized_name}|{id_prefix}|{company}".encode("utf-8")
+        ).hexdigest()[:24]
+        return f"PGK-{identity_hash}"
     permit = f"{_clean(hkmo_permit_first4)}{_clean(hkmo_permit_last6)}"
     if permit and _clean(birth_date):
         identity_hash = hashlib.sha256(
@@ -43,9 +50,16 @@ def sqlite_person_global_key(name, permit_first4, permit_last6, birth_date, main
     )
 
 
+def sqlite_person_global_key_v3(name, mainland_id_first4, company_name):
+    return generate_person_global_key(
+        name, mainland_id_first4=mainland_id_first4, company_name=company_name,
+    )
+
+
 def backfill_person_global_keys(db):
     rows = db.execute(
-        """SELECT id,name,hkmo_permit_first4,hkmo_permit_last6,birth_date,
+        """SELECT id,name,company_name,mainland_id_first4,
+                  hkmo_permit_first4,hkmo_permit_last6,birth_date,
                   COALESCE(mainland_id_last4,id_last4) AS mainland_id_last4
            FROM people WHERE person_global_key IS NULL OR person_global_key='' ORDER BY id"""
     ).fetchall()
@@ -58,6 +72,7 @@ def backfill_person_global_keys(db):
         key = generate_person_global_key(
             person["name"], person["hkmo_permit_first4"], person["hkmo_permit_last6"],
             person["birth_date"], person["mainland_id_last4"],
+            person["mainland_id_first4"], person["company_name"],
         )
         if key in used:
             key = f"P-{uuid.uuid4()}"
@@ -143,20 +158,41 @@ def process_person_events(db, notification_hook=None, today=None):
     for row in rows:
         scanned += 1
         event = dict(row)
+        if event["status"] == "failed" and int(event.get("retry_count") or 0) >= int(event.get("max_retries") or 3):
+            continue
         new_status = _event_status(
             event["trigger_date"], event.get("due_date"), event["status"], today,
         )
         if new_status == event["status"]:
             continue
-        db.execute(
-            "UPDATE person_events SET status=?,updated_at=CURRENT_TIMESTAMP WHERE id=?",
-            (new_status, event["id"]),
-        )
-        changed += 1
-        if notification_hook:
-            notification_hook(event, event["status"], new_status)
+        try:
+            if notification_hook:
+                notification_hook(event, event["status"], new_status)
+            db.execute(
+                """UPDATE person_events SET status=?,retry_count=0,last_error=NULL,
+                          next_retry_at=CURRENT_TIMESTAMP,updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (new_status, event["id"]),
+            )
+            changed += 1
+        except Exception as error:
+            retries = int(event.get("retry_count") or 0) + 1
+            db.execute(
+                """UPDATE person_events SET status='failed',retry_count=?,last_error=?,
+                          next_retry_at=datetime('now',?),updated_at=CURRENT_TIMESTAMP WHERE id=?""",
+                (retries, str(error)[:1000], f"+{min(300, 5 * 2 ** retries)} seconds", event["id"]),
+            )
     db.commit()
     return {"scanned": scanned, "changed": changed, "run_date": today.isoformat()}
+
+
+def recover_failed_person_events(db):
+    cursor = db.execute(
+        """UPDATE person_events SET status='pending',next_retry_at=CURRENT_TIMESTAMP,
+                  updated_at=CURRENT_TIMESTAMP
+           WHERE status='failed' AND retry_count<max_retries AND next_retry_at<=CURRENT_TIMESTAMP"""
+    )
+    db.commit()
+    return cursor.rowcount
 
 
 def refresh_person_events(db):

@@ -112,7 +112,11 @@ CREATE TABLE IF NOT EXISTS person_events (
     trigger_date DATE NOT NULL,
     due_date DATE NULL,
     status TEXT NOT NULL DEFAULT 'pending'
-        CHECK(status IN ('pending','due','completed','overdue')),
+        CHECK(status IN ('pending','due','completed','overdue','failed')),
+    retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3,
+    last_error TEXT NULL,
+    next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP,
     source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
     source_ref TEXT NOT NULL UNIQUE,
     rule_version TEXT NOT NULL,
@@ -133,14 +137,60 @@ CREATE INDEX IF NOT EXISTS idx_person_documents_global_key
 INSERT OR IGNORE INTO rule_versions(rule_name,version,description) VALUES
     ('person_global_key','person-global-key-v1','人员全局唯一标识生成规则'),
     ('person_global_key','person-global-key-v2','规范化人员全局唯一标识生成规则'),
+    ('person_global_key','person-global-key-v3','姓名、证件前缀与公司确定性身份规则'),
     ('document_binding','document-binding-v1','人员资料绑定来源规则'),
     ('document_binding','document-binding-v2','带置信度与人工覆盖日志的资料绑定规则'),
     ('person_event_engine','person-event-engine-v1','人员事件自动生成规则'),
     ('person_event_engine','person-event-engine-v2','支持 due 状态的人员事件调度规则');
 
 UPDATE rule_versions SET is_active=CASE
-    WHEN version IN ('person-global-key-v2','document-binding-v2','person-event-engine-v2')
+    WHEN version IN ('person-global-key-v3','document-binding-v2','person-event-engine-v2')
     THEN 1 ELSE 0 END;
+
+CREATE TABLE IF NOT EXISTS domain_events (
+    id INTEGER PRIMARY KEY, event_id TEXT NOT NULL UNIQUE, event_type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0, max_retries INTEGER NOT NULL DEFAULT 3,
+    next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP, worker_id TEXT, trace_id TEXT NOT NULL,
+    user_id INTEGER, last_error TEXT, started_at DATETIME, completed_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_domain_events_dispatch ON domain_events(status,next_retry_at,id);
+
+CREATE TABLE IF NOT EXISTS notification_queue (
+    id INTEGER PRIMARY KEY, notification_id TEXT NOT NULL UNIQUE, channel TEXT NOT NULL,
+    recipient TEXT NOT NULL, title TEXT NOT NULL, message TEXT NOT NULL, event_id TEXT,
+    status TEXT NOT NULL DEFAULT 'pending', retry_count INTEGER NOT NULL DEFAULT 0,
+    max_retries INTEGER NOT NULL DEFAULT 3, next_retry_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    trace_id TEXT NOT NULL, last_error TEXT, created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    updated_at DATETIME DEFAULT CURRENT_TIMESTAMP, sent_at DATETIME
+);
+CREATE INDEX IF NOT EXISTS idx_notification_queue_dispatch ON notification_queue(status,next_retry_at,id);
+
+CREATE TABLE IF NOT EXISTS background_jobs (
+    id INTEGER PRIMARY KEY, job_id TEXT NOT NULL UNIQUE, job_type TEXT NOT NULL,
+    payload TEXT NOT NULL DEFAULT '{}', status TEXT NOT NULL DEFAULT 'pending',
+    retry_count INTEGER NOT NULL DEFAULT 0, max_retries INTEGER NOT NULL DEFAULT 3,
+    next_run_at DATETIME DEFAULT CURRENT_TIMESTAMP, worker_id TEXT, trace_id TEXT NOT NULL,
+    last_error TEXT, started_at DATETIME, completed_at DATETIME,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
+);
+CREATE INDEX IF NOT EXISTS idx_background_jobs_dispatch ON background_jobs(status,next_run_at,id);
+
+CREATE TABLE IF NOT EXISTS worker_heartbeats (
+    worker_name TEXT PRIMARY KEY, worker_id TEXT NOT NULL, status TEXT NOT NULL,
+    last_seen DATETIME DEFAULT CURRENT_TIMESTAMP, detail TEXT
+);
+
+CREATE TABLE IF NOT EXISTS person_merge_workflows (
+    id INTEGER PRIMARY KEY, workflow_id TEXT NOT NULL UNIQUE,
+    source_person_id INTEGER NOT NULL, target_person_id INTEGER NOT NULL,
+    status TEXT NOT NULL DEFAULT 'candidate', requested_by INTEGER, confirmed_by INTEGER,
+    rolled_back_by INTEGER, trace_id TEXT NOT NULL, snapshot_json TEXT,
+    created_at DATETIME DEFAULT CURRENT_TIMESTAMP, updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
+    CHECK(source_person_id != target_person_id)
+);
+CREATE INDEX IF NOT EXISTS idx_person_merge_status ON person_merge_workflows(status,created_at);
 
 CREATE TABLE IF NOT EXISTS person_cases (
     id INTEGER PRIMARY KEY,
@@ -243,6 +293,7 @@ CREATE TABLE IF NOT EXISTS contract (
     contract_no TEXT NULL,
     company_name TEXT NOT NULL,
     person_id INTEGER NULL,
+    person_global_key TEXT NULL,
     quota_id INTEGER NULL,
     entry_date DATE NULL,
     arrival_date DATE NULL,
@@ -273,6 +324,7 @@ CREATE TABLE IF NOT EXISTS event (
     id INTEGER PRIMARY KEY,
     event_type TEXT,
     person_id INTEGER,
+    person_global_key TEXT NULL,
     quota_id INTEGER,
     contract_id INTEGER,
     description TEXT,

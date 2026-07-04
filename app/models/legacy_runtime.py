@@ -14,6 +14,8 @@ from flask import (
     Flask, abort, flash, g, jsonify, redirect, render_template, request, session,
     send_from_directory, url_for,
 )
+from jinja2 import ChainableUndefined
+from werkzeug.routing import BuildError
 from werkzeug.utils import secure_filename
 
 from app.utils.responses import api_response
@@ -28,12 +30,16 @@ from app.services.person_profile_service import (
     get_person_profile, save_person_document_batch,
     document_hash_from_path, find_duplicate_document, queue_conflict, queue_retry,
     search_people_for_binding, suggest_case_for_document, suggest_person_by_filename,
+    suggest_person_for_document,
 )
 from app.services.person_system_service import (
     DOCUMENT_BINDING_RULE_VERSION, EVENT_ENGINE_RULE_VERSION, PERSON_KEY_RULE_VERSION,
     backfill_person_global_keys, find_duplicate_people, process_person_events,
-    refresh_person_events, sqlite_person_global_key,
+    refresh_person_events, sqlite_person_global_key, sqlite_person_global_key_v3,
 )
+from app.services.contract_safety_service import filter_valid_contracts, valid_contract_id
+from app.persistence.reliability_schema import initialize_reliability_schema
+from app.persistence.safe_sqlite import connect_reliably
 
 
 BASE_DIR = Path(__file__).resolve().parent.parent.parent
@@ -58,6 +64,41 @@ app.config.update(
     TEMPLATES_AUTO_RELOAD=True,
     SEND_FILE_MAX_AGE_DEFAULT=0,
 )
+app.jinja_env.undefined = ChainableUndefined
+app.jinja_env.globals.setdefault("can", lambda _permission: True)
+
+
+def _safe_get(value, key, default=""):
+    if value is None:
+        return default
+    try:
+        return value.get(key, default) if hasattr(value, "get") else value[key]
+    except (KeyError, TypeError, IndexError, AttributeError):
+        return default
+
+
+app.jinja_env.filters.setdefault("safe_get", _safe_get)
+app.jinja_env.filters.setdefault(
+    "safe_id", lambda value: str(value).strip()
+    if valid_contract_id(value) else "",
+)
+
+
+def safe_url(endpoint, **values):
+    """Template-only URL builder: invalid IDs or unknown endpoints render as '#'."""
+    for key, value in values.items():
+        if key.endswith("_id") and not valid_contract_id(value):
+            app.logger.warning("Skipped unsafe URL endpoint=%s missing=%s", endpoint, key)
+            return "#"
+    try:
+        return url_for(endpoint, **values)
+    except (BuildError, TypeError, ValueError):
+        app.logger.exception("Template URL build failed endpoint=%s", endpoint)
+        return "#"
+
+
+app.jinja_env.globals["safe_url"] = safe_url
+app.jinja_env.globals["url_for"] = safe_url
 CONTRACT_STATUSES = CONTRACT_LIFECYCLE
 QUOTA_TYPES = ("SWD", "LD")
 QUOTA_TOTAL_MONTHS = 24
@@ -71,10 +112,14 @@ STANDARD_TABLES = {"person", "quota", "contract", "event", "risk"}
 
 def get_db():
     if "db" not in g:
-        g.db = sqlite3.connect(app.config["DATABASE"])
+        g.db = connect_reliably(app.config["DATABASE"], timeout=30)
         g.db.row_factory = sqlite3.Row
         g.db.create_function("person_global_key", 5, sqlite_person_global_key)
+        g.db.create_function("person_global_key_v3", 3, sqlite_person_global_key_v3)
         g.db.execute("PRAGMA foreign_keys = ON")
+        g.db.execute("PRAGMA journal_mode = WAL")
+        g.db.execute("PRAGMA synchronous = NORMAL")
+        g.db.execute("PRAGMA busy_timeout = 30000")
     return g.db
 
 
@@ -1394,7 +1439,11 @@ def init_db():
             trigger_date TEXT NOT NULL,
             due_date TEXT,
             status TEXT NOT NULL DEFAULT 'pending'
-                CHECK(status IN ('pending','due','completed','overdue')),
+                CHECK(status IN ('pending','due','completed','overdue','failed')),
+            retry_count INTEGER NOT NULL DEFAULT 0,
+            max_retries INTEGER NOT NULL DEFAULT 3,
+            last_error TEXT,
+            next_retry_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
             source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
             source_ref TEXT NOT NULL UNIQUE,
             rule_version TEXT NOT NULL,
@@ -1418,6 +1467,7 @@ def init_db():
             ("person_event_engine", EVENT_ENGINE_RULE_VERSION, "人员事件自动生成规则"),
         ),
     )
+    initialize_reliability_schema(db)
     db.execute(
         """UPDATE rule_versions SET is_active=CASE
              WHEN version IN (?,?,?) THEN 1 ELSE 0 END""",
@@ -1426,7 +1476,7 @@ def init_db():
     person_events_sql = db.execute(
         "SELECT sql FROM sqlite_master WHERE type='table' AND name='person_events'"
     ).fetchone()["sql"]
-    if "'due'" not in person_events_sql:
+    if "'due'" not in person_events_sql or "'failed'" not in person_events_sql:
         db.executescript(
             """BEGIN IMMEDIATE;
             ALTER TABLE person_events RENAME TO person_events_status_legacy;
@@ -1438,7 +1488,11 @@ def init_db():
                 trigger_date TEXT NOT NULL,
                 due_date TEXT,
                 status TEXT NOT NULL DEFAULT 'pending'
-                    CHECK(status IN ('pending','due','completed','overdue')),
+                    CHECK(status IN ('pending','due','completed','overdue','failed')),
+                retry_count INTEGER NOT NULL DEFAULT 0,
+                max_retries INTEGER NOT NULL DEFAULT 3,
+                last_error TEXT,
+                next_retry_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                 source TEXT NOT NULL CHECK(source IN ('contract','visa','document','system')),
                 source_ref TEXT NOT NULL UNIQUE,
                 rule_version TEXT NOT NULL,
@@ -1446,9 +1500,11 @@ def init_db():
                 updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
             );
             INSERT INTO person_events
-                (id,person_global_key,event_type,trigger_date,due_date,status,source,
+                (id,person_global_key,event_type,trigger_date,due_date,status,
+                 retry_count,max_retries,last_error,next_retry_at,source,
                  source_ref,rule_version,created_at,updated_at)
-            SELECT id,person_global_key,event_type,trigger_date,due_date,status,source,
+            SELECT id,person_global_key,event_type,trigger_date,due_date,status,
+                   0,3,NULL,CURRENT_TIMESTAMP,source,
                    source_ref,rule_version,created_at,updated_at
             FROM person_events_status_legacy;
             DROP TABLE person_events_status_legacy;
@@ -1472,6 +1528,8 @@ def init_db():
     for table, additions in {
         "risks": {"person_case_id": "INTEGER", "due_date": "TEXT"},
         "tasks": {"person_case_id": "INTEGER"},
+        "contracts": {"person_global_key": "TEXT"},
+        "events": {"person_global_key": "TEXT"},
     }.items():
         existing = {row["name"] for row in db.execute(f"PRAGMA table_info({table})")}
         for column, definition in additions.items():
@@ -1511,6 +1569,22 @@ def init_db():
     db.execute(
         "CREATE INDEX IF NOT EXISTS idx_person_documents_global_key ON person_documents(person_global_key,is_deleted)"
     )
+    db.execute(
+        """UPDATE contracts SET person_global_key=(
+             SELECT person_global_key FROM people WHERE people.id=contracts.person_id)
+           WHERE person_global_key IS NULL"""
+    )
+    db.execute(
+        """UPDATE events SET person_global_key=(
+             SELECT person_global_key FROM people WHERE people.id=events.person_id)
+           WHERE person_global_key IS NULL"""
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_contracts_global_key ON contracts(person_global_key)"
+    )
+    db.execute(
+        "CREATE INDEX IF NOT EXISTS idx_events_global_key ON events(person_global_key)"
+    )
     db.executescript(
         """DROP TRIGGER IF EXISTS trg_people_global_key_insert;
         DROP TRIGGER IF EXISTS trg_person_documents_global_key_insert;
@@ -1519,6 +1593,11 @@ def init_db():
         DROP TRIGGER IF EXISTS trg_people_change_update;
         DROP TRIGGER IF EXISTS trg_document_binding_change_insert;
         DROP TRIGGER IF EXISTS trg_document_binding_change_update;"""
+        """DROP TRIGGER IF EXISTS trg_people_global_key_immutable;
+        DROP TRIGGER IF EXISTS trg_contracts_global_key_insert;
+        DROP TRIGGER IF EXISTS trg_contracts_global_key_update;
+        DROP TRIGGER IF EXISTS trg_events_global_key_insert;
+        DROP TRIGGER IF EXISTS trg_events_global_key_update;"""
     )
     db.executescript(
         f"""
@@ -1527,9 +1606,51 @@ def init_db():
         WHEN NEW.person_global_key IS NULL OR NEW.person_global_key=''
         BEGIN
           UPDATE people SET
-            person_global_key=person_global_key(NEW.name,NEW.hkmo_permit_first4,
-              NEW.hkmo_permit_last6,NEW.birth_date,COALESCE(NEW.mainland_id_last4,NEW.id_last4)),
+            person_global_key=CASE
+              WHEN NULLIF(NEW.mainland_id_first4,'') IS NOT NULL
+               AND NULLIF(NEW.company_name,'') IS NOT NULL
+              THEN person_global_key_v3(NEW.name,NEW.mainland_id_first4,NEW.company_name)
+              ELSE person_global_key(NEW.name,NEW.hkmo_permit_first4,
+                NEW.hkmo_permit_last6,NEW.birth_date,COALESCE(NEW.mainland_id_last4,NEW.id_last4))
+            END,
             identity_rule_version='{PERSON_KEY_RULE_VERSION}'
+          WHERE id=NEW.id;
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_people_global_key_immutable
+        BEFORE UPDATE OF person_global_key ON people
+        WHEN OLD.person_global_key IS NOT NULL AND OLD.person_global_key!=''
+          AND NEW.person_global_key IS NOT OLD.person_global_key
+        BEGIN
+          SELECT RAISE(ABORT,'person_global_key is immutable');
+        END;
+
+        CREATE TRIGGER IF NOT EXISTS trg_contracts_global_key_insert
+        AFTER INSERT ON contracts
+        BEGIN
+          UPDATE contracts SET person_global_key=(
+            SELECT person_global_key FROM people WHERE id=NEW.person_id)
+          WHERE contract_id=NEW.contract_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_contracts_global_key_update
+        AFTER UPDATE OF person_id ON contracts
+        BEGIN
+          UPDATE contracts SET person_global_key=(
+            SELECT person_global_key FROM people WHERE id=NEW.person_id)
+          WHERE contract_id=NEW.contract_id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_events_global_key_insert
+        AFTER INSERT ON events
+        BEGIN
+          UPDATE events SET person_global_key=(
+            SELECT person_global_key FROM people WHERE id=NEW.person_id)
+          WHERE id=NEW.id;
+        END;
+        CREATE TRIGGER IF NOT EXISTS trg_events_global_key_update
+        AFTER UPDATE OF person_id ON events
+        BEGIN
+          UPDATE events SET person_global_key=(
+            SELECT person_global_key FROM people WHERE id=NEW.person_id)
           WHERE id=NEW.id;
         END;
 
@@ -2580,7 +2701,7 @@ def index(default_view="overview"):
         SELECT c.*, p.id_last4, p.permit_last4,
                CAST(julianday(c.end_date) - julianday(date('now', 'localtime')) AS INTEGER) AS remaining_days
         FROM contracts c LEFT JOIN people p ON p.id = c.person_id AND p.is_deleted=0
-        WHERE c.is_deleted=0
+        WHERE c.is_deleted=0 AND c.contract_id IS NOT NULL AND trim(c.contract_id)!=''
           AND (? = '' OR c.contract_id LIKE ? OR c.person_name LIKE ? OR c.company LIKE ?)
           AND (? = '' OR c.status = ?)
         ORDER BY CASE WHEN c.status = '完成合约' THEN 1 ELSE 0 END,
@@ -2588,6 +2709,7 @@ def index(default_view="overview"):
         """,
         (keyword, like, like, like, selected_status, selected_status),
     ).fetchall()
+    contracts = filter_valid_contracts(contracts)
 
     people = db.execute(
         """
@@ -2790,10 +2912,12 @@ def index(default_view="overview"):
                     AS remaining_days
            FROM contracts c
            WHERE c.is_deleted=0 AND c.status!='完成合约'
+             AND c.contract_id IS NOT NULL AND trim(c.contract_id)!=''
              AND date(c.end_date) BETWEEN date('now','localtime')
                                       AND date('now','localtime','+90 days')
            ORDER BY c.end_date LIMIT 12"""
     ).fetchall()
+    expiring_contracts_90 = filter_valid_contracts(expiring_contracts_90)
     certificate_risks = [
         item for item in risks
         if item["status"] == "开放" and item["risk_type"].startswith("证件")
@@ -2975,6 +3099,7 @@ def index(default_view="overview"):
                    ORDER BY c.end_date DESC""",
                 (matched_person["id"], matched_person["name"]),
             ).fetchall()
+            person_contracts = filter_valid_contracts(person_contracts)
             person_risks = db.execute(
                 """SELECT * FROM risks
                    WHERE is_deleted=0 AND (person_id=? OR contract_id IN
@@ -3012,10 +3137,17 @@ def index(default_view="overview"):
             }
         elif search_results["contracts"]:
             contract = search_results["contracts"][0]
-            needs_action = contract["remaining_days"] <= 90 and contract["status"] != "完成合约"
+            remaining_days = contract["remaining_days"]
+            needs_action = (
+                remaining_days is not None and remaining_days <= 90
+                and contract["status"] != "完成合约"
+            )
             one_line_result = {
                 "subject": contract["contract_id"],
-                "current_status": f"{contract['status']} · 剩余 {contract['remaining_days']} 天",
+                "current_status": (
+                    f"{contract['status']} · 剩余 {remaining_days} 天"
+                    if remaining_days is not None else f"{contract['status']} · 日期待补"
+                ),
                 "next_action": "建议续约 / 替补" if needs_action else "按当前合同状态继续跟进",
                 "needs_action": "Yes" if needs_action else "No",
                 "detail_url": url_for("contract_detail", contract_id=contract["contract_id"]),
@@ -3671,6 +3803,10 @@ def create_decision_reminder_task():
 
 @app.get("/contracts/<contract_id>")
 def contract_detail(contract_id):
+    if not valid_contract_id(contract_id):
+        return render_template(
+            "error.html", status_code=404, message="无合同"
+        ), 404
     db = get_db()
     contract = db.execute(
         """SELECT c.*, p.id_last4, p.permit_last4,
@@ -3681,7 +3817,9 @@ def contract_detail(contract_id):
         (contract_id,),
     ).fetchone()
     if not contract:
-        abort(404)
+        return render_template(
+            "error.html", status_code=404, message="无合同"
+        ), 404
     person_id = contract["person_id"]
     quota = None
     events = []
@@ -3731,6 +3869,9 @@ def contract_detail(contract_id):
 
 @app.post("/contracts/<contract_id>/status")
 def update_contract_status(contract_id):
+    if not valid_contract_id(contract_id):
+        flash("无合同：合同编号缺失。", "error")
+        return redirect(url_for("contracts_page"))
     status = normalize_contract_status(request.form.get("status", ""))
     if status not in CONTRACT_STATUSES:
         flash("合同状态无效。", "error")
@@ -4400,7 +4541,12 @@ def view_person_document(document_id):
 @app.get("/api/person-documents/suggest")
 def suggest_person_document_owner():
     filename = request.args.get("filename", "")[:255]
-    return api_response(0, "ok", suggest_person_by_filename(get_db(), filename))
+    return api_response(0, "ok", suggest_person_for_document(
+        get_db(), filename=filename,
+        ocr_text=request.args.get("ocr_text", "")[:2000],
+        metadata=request.args.get("metadata", "")[:1000],
+        person_global_key=request.args.get("person_global_key", "")[:100] or None,
+    ))
 
 
 @app.get("/api/people/search")
@@ -4582,7 +4728,7 @@ def download_document(document_id):
         "SELECT * FROM documents WHERE id=? AND is_deleted=0", (document_id,)
     ).fetchone()
     if not document:
-        return "Not found", 404
+        abort(404)
     return send_from_directory(
         app.config["UPLOAD_FOLDER"], document["stored_name"],
         as_attachment=True, download_name=document["filename"],

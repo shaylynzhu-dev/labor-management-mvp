@@ -12,7 +12,15 @@ async function apiFetch(url, options = {}) {
       ...(options.headers || {}),
     },
   });
-  const payload = await response.json();
+  const contentType = response.headers.get('content-type') || '';
+  let payload;
+  try {
+    payload = contentType.includes('application/json')
+      ? await response.json()
+      : {code: 'INVALID_RESPONSE', message: '服务返回了不可读取的内容', data: null};
+  } catch (_error) {
+    payload = {code: 'INVALID_RESPONSE', message: '服务响应解析失败，请稍后重试', data: null};
+  }
   if (!response.ok || payload.code !== 0) {
     const error = new Error(payload.message || '请求失败');
     error.data = payload.data;
@@ -23,6 +31,14 @@ async function apiFetch(url, options = {}) {
 }
 
 window.labourApi = {request: apiFetch};
+
+window.addEventListener('error', () => {
+  document.body?.insertAdjacentHTML('beforeend', '<div class="ui-safe-toast">页面部分功能暂时不可用，其他操作不受影响。</div>');
+});
+window.addEventListener('unhandledrejection', (event) => {
+  event.preventDefault();
+  document.body?.insertAdjacentHTML('beforeend', '<div class="ui-safe-toast">操作未完成，请稍后重试。</div>');
+});
 
 function openInlineEditor(id) {
   const editor = document.getElementById(id);

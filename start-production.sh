@@ -16,11 +16,24 @@ echo "启动端口: ${PORT}"
 echo "database path: ${LABOUR_OS_DATABASE_PATH}"
 echo "production mode: ${LABOUR_OS_ENV}"
 
-exec gunicorn app:app \
+mkdir -p logs
+
+python -m app.background.worker_manager >> logs/worker.log 2>&1 &
+WORKER_MANAGER_PID=$!
+
+gunicorn app:app \
   --bind "0.0.0.0:${PORT}" \
   --workers "${WEB_CONCURRENCY}" \
   --threads "${GUNICORN_THREADS}" \
   --timeout 120 \
   --access-logfile - \
   --error-logfile - \
-  --capture-output
+  --capture-output &
+GUNICORN_PID=$!
+
+cleanup() {
+  kill -TERM "${WORKER_MANAGER_PID}" "${GUNICORN_PID}" 2>/dev/null || true
+  wait "${WORKER_MANAGER_PID}" "${GUNICORN_PID}" 2>/dev/null || true
+}
+trap cleanup EXIT INT TERM
+wait "${GUNICORN_PID}"

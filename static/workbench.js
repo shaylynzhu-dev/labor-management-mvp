@@ -307,4 +307,69 @@
       }
     });
   });
+
+  const workerBadge = document.querySelector('[data-worker-status]');
+  const notificationPanel = document.querySelector('[data-notification-panel]');
+  const notificationList = document.querySelector('[data-notification-list]');
+  const notificationCount = document.querySelector('[data-notification-count]');
+
+  async function refreshSystemIndicators() {
+    try {
+      const status = await window.labourApi.request('/api/system/worker-status');
+      if (workerBadge) {
+        workerBadge.textContent = `Worker ${status.status}`;
+        workerBadge.classList.toggle('running', status.status === 'running');
+        workerBadge.classList.toggle('stopped', status.status !== 'running');
+      }
+      const notifications = await window.labourApi.request('/api/notifications');
+      if (notificationCount) notificationCount.textContent = notifications.length;
+      if (notificationList) {
+        notificationList.innerHTML = notifications.length
+          ? notifications.map((item) => `<article><strong>${escape(item.title)}</strong><p>${escape(item.message)}</p><small>${escape(item.created_at)}</small></article>`).join('')
+          : '<p class="empty-block">暂无通知</p>';
+      }
+    } catch (_error) {
+      if (workerBadge) workerBadge.textContent = 'Worker unknown';
+    }
+  }
+  document.querySelectorAll('[data-notification-toggle]').forEach((button) => button.addEventListener('click', () => {
+    if (notificationPanel) notificationPanel.hidden = !notificationPanel.hidden;
+  }));
+  refreshSystemIndicators();
+  window.setInterval(refreshSystemIndicators, 30000);
+
+  const mergeDialog = document.getElementById('merge-candidate-dialog');
+  const mergeHost = mergeDialog?.querySelector('[data-merge-candidates]');
+  document.querySelectorAll('[data-merge-person]').forEach((button) => button.addEventListener('click', async () => {
+    mergeDialog?.showModal();
+    if (mergeHost) mergeHost.innerHTML = '<p class="empty-block">正在检查…</p>';
+    try {
+      const result = await window.labourApi.request(`/api/people/${encodeURIComponent(button.dataset.mergePerson)}/merge-candidates`);
+      if (!result.candidates.length) {
+        mergeHost.innerHTML = '<p class="empty-block">未发现匹配度超过 85% 的疑似重复人员。</p>';
+        return;
+      }
+      mergeHost.replaceChildren();
+      result.candidates.forEach((candidate) => {
+        const article = document.createElement('article');
+        article.className = 'merge-candidate-card';
+        article.innerHTML = `<div><strong>${escape(candidate.name)}</strong><span>${escape(candidate.company_name || '公司待补充')}</span><small>匹配度 ${Math.round(candidate.confidence * 100)}% · ${escape((candidate.reasons || []).join('、'))}</small></div><button type="button" class="button secondary">人工确认合并</button>`;
+        article.querySelector('button').addEventListener('click', async () => {
+          if (!window.confirm(`确认将“${button.dataset.personName}”合并到“${candidate.name}”？此操作可回滚。`)) return;
+          try {
+            const workflow = await window.labourApi.request('/api/merge-workflows', {
+              method: 'POST', body: JSON.stringify({source_person_id: button.dataset.mergePerson, target_person_id: candidate.id}),
+            });
+            await window.labourApi.request(`/api/merge-workflows/${encodeURIComponent(workflow.workflow_id)}/confirm`, {method: 'POST'});
+            window.location.reload();
+          } catch (error) {
+            window.alert(error.message || '合并失败，数据未改变。');
+          }
+        });
+        mergeHost.append(article);
+      });
+    } catch (error) {
+      mergeHost.innerHTML = `<p class="query-error">${escape(error.message || '查重失败')}</p>`;
+    }
+  }));
 })();

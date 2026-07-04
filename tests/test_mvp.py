@@ -23,11 +23,21 @@ class LabourOSMVPTest(unittest.TestCase):
             DATABASE=self.test_database,
             UPLOAD_FOLDER=upload_dir,
         )
+        self.production_database = app.extensions["production_database"]
+        self.original_production_database_path = self.production_database.path
+        self.production_database.path = str(self.test_database)
+        self.production_database.initialize()
+        with self.production_database.transaction() as connection:
+            connection.execute(
+                """INSERT OR IGNORE INTO users(id,username,password_hash,role,active)
+                   VALUES (1,'test-admin','test-only','admin',1)"""
+            )
         with app.app_context():
             init_db()
         self.client = app.test_client()
 
     def tearDown(self):
+        self.production_database.path = self.original_production_database_path
         self.temp_dir.cleanup()
 
     def db_row(self, sql, parameters=()):
@@ -246,16 +256,18 @@ class LabourOSMVPTest(unittest.TestCase):
             data={"file": (io.BytesIO(people_bytes), "people.xlsx")},
             content_type="multipart/form-data",
         )
+        duplicate_payload = duplicate_response.get_json()
+        self.assertEqual(duplicate_payload["code"], 0)
+        self.assertEqual(duplicate_payload["message"], "导入完成")
         self.assertEqual(
-            duplicate_response.get_json(),
+            {key: duplicate_payload["data"][key]
+             for key in ("type", "success", "skipped", "failed", "errors")},
             {
-                "code": 0, "message": "导入完成",
-                "data": {
-                    "type": "人员 Excel", "success": 0,
-                    "skipped": 2, "failed": 0, "errors": [],
-                },
+                "type": "人员 Excel", "success": 0,
+                "skipped": 2, "failed": 0, "errors": [],
             },
         )
+        self.assertTrue(duplicate_payload["data"]["batch_version"].startswith("BATCH-"))
 
         quota_file = io.BytesIO()
         pd.DataFrame(
@@ -301,16 +313,18 @@ class LabourOSMVPTest(unittest.TestCase):
             data={"file": (io.BytesIO(quota_bytes), "quotas.xlsx")},
             content_type="multipart/form-data",
         )
+        duplicate_payload = duplicate_response.get_json()
+        self.assertEqual(duplicate_payload["code"], 0)
+        self.assertEqual(duplicate_payload["message"], "导入完成")
         self.assertEqual(
-            duplicate_response.get_json(),
+            {key: duplicate_payload["data"][key]
+             for key in ("type", "success", "skipped", "failed", "errors")},
             {
-                "code": 0, "message": "导入完成",
-                "data": {
-                    "type": "配额 Excel", "success": 0,
-                    "skipped": 2, "failed": 0, "errors": [],
-                },
+                "type": "配额 Excel", "success": 0,
+                "skipped": 2, "failed": 0, "errors": [],
             },
         )
+        self.assertTrue(duplicate_payload["data"]["batch_version"].startswith("BATCH-"))
 
         invalid_file = io.BytesIO()
         pd.DataFrame(

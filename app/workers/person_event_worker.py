@@ -5,7 +5,9 @@ from pathlib import Path
 import sqlite3
 import time
 
-from app.services.person_system_service import process_person_events, refresh_person_events
+from app.services.person_system_service import (
+    process_person_events, recover_failed_person_events, refresh_person_events,
+)
 
 
 BASE_DIR = Path(__file__).resolve().parents[2]
@@ -30,6 +32,7 @@ def run_once(database_path=DATABASE):
     connection.execute("PRAGMA busy_timeout=30000")
     try:
         refresh_person_events(connection)
+        recover_failed_person_events(connection)
         return process_person_events(connection, notification_hook=notification_hook)
     finally:
         connection.close()
@@ -44,7 +47,7 @@ def main():
     args = parser.parse_args()
     logging.basicConfig(
         level=os.environ.get("LOG_LEVEL", "INFO"),
-        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+        format="%(asctime)s %(levelname)s %(name)s trace_id=system user_id=None event_type=PERSON_EVENT %(message)s",
     )
     while True:
         result = run_once()

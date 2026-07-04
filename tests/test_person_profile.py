@@ -71,6 +71,13 @@ class PersonProfileTest(unittest.TestCase):
                 self.assertIsNotNone(db.execute(
                     "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
                 ).fetchone())
+            for table in (
+                "domain_events", "notification_queue", "background_jobs",
+                "worker_heartbeats", "person_merge_workflows",
+            ):
+                self.assertIsNotNone(db.execute(
+                    "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?", (table,)
+                ).fetchone())
 
             person = {
                 "worker_type": "new", "mainland_id_first4": "1234",
@@ -91,6 +98,13 @@ class PersonProfileTest(unittest.TestCase):
         self.assertTrue(generate_person_global_key(
             "规则人员", "CJ52", "123456", "1990-01-01", "8899"
         ).startswith("HKP-"))
+        v3_key = generate_person_global_key(
+            "规则人员", mainland_id_first4="4401", company_name="测试公司",
+        )
+        self.assertTrue(v3_key.startswith("PGK-"))
+        self.assertEqual(v3_key, generate_person_global_key(
+            " 规则 人员 ", mainland_id_first4="４４０１", company_name="测试 公司",
+        ))
         with app.app_context():
             db = get_db()
             person_id = db.execute(

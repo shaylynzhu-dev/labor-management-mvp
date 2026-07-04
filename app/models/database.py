@@ -1,7 +1,10 @@
 import sqlite3
 from contextlib import contextmanager
+import time
 
-from app.services.person_system_service import sqlite_person_global_key
+from app.services.person_system_service import sqlite_person_global_key, sqlite_person_global_key_v3
+from app.persistence.reliability_schema import initialize_reliability_schema
+from app.persistence.safe_sqlite import connect_reliably
 
 
 class Database:
@@ -9,9 +12,10 @@ class Database:
         self.path = str(path)
 
     def connect(self):
-        connection = sqlite3.connect(self.path, timeout=30)
+        connection = connect_reliably(self.path, timeout=30)
         connection.row_factory = sqlite3.Row
         connection.create_function("person_global_key", 5, sqlite_person_global_key)
+        connection.create_function("person_global_key_v3", 3, sqlite_person_global_key_v3)
         connection.execute("PRAGMA foreign_keys=ON")
         connection.execute("PRAGMA journal_mode=WAL")
         connection.execute("PRAGMA busy_timeout=30000")
@@ -21,9 +25,23 @@ class Database:
     def transaction(self):
         connection = self.connect()
         try:
-            connection.execute("BEGIN IMMEDIATE")
+            for attempt in range(6):
+                try:
+                    connection.execute("BEGIN IMMEDIATE")
+                    break
+                except sqlite3.OperationalError as error:
+                    if "locked" not in str(error).casefold() or attempt == 5:
+                        raise
+                    time.sleep(0.05 * (2 ** attempt))
             yield connection
-            connection.commit()
+            for attempt in range(6):
+                try:
+                    connection.commit()
+                    break
+                except sqlite3.OperationalError as error:
+                    if "locked" not in str(error).casefold() or attempt == 5:
+                        raise
+                    time.sleep(0.05 * (2 ** attempt))
         except Exception:
             connection.rollback()
             raise
@@ -61,6 +79,7 @@ class Database:
                     ON import_logs(created_at DESC);
                 """
             )
+            initialize_reliability_schema(connection)
             import_columns = {
                 row["name"]
                 for row in connection.execute("PRAGMA table_info(import_logs)").fetchall()
